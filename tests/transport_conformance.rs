@@ -28,11 +28,12 @@ async fn start(key: HostKeyPair) -> (ServerEncryptedIO, tokio::task::JoinHandle<
 
 #[tokio::test]
 async fn wrong_kex_guess_discarded() {
+    for wrong_host in [false, true] {
     let (mut io, task) = start(HostKeyPair::generate_ed25519()).await;
     io.read_unencrypted_packet(3).await.unwrap();
     let mut offer = generate_client_kexinit_with_prefs(Some("curve25519-sha256"), None, None);
-    replace_list(&mut offer, 0, "unknown-kex,curve25519-sha256");
-    replace_list(&mut offer, 1, "ssh-ed25519");
+    replace_list(&mut offer, 0, if wrong_host { "curve25519-sha256" } else { "unknown-kex,curve25519-sha256" });
+    replace_list(&mut offer, 1, if wrong_host { "unknown-host,ssh-ed25519" } else { "ssh-ed25519" });
     let follows = offer.len() - 5;
     offer[follows] = 1;
     io.stream.write_all(&build_unencrypted_packet(&offer)).await.unwrap();
@@ -47,6 +48,7 @@ async fn wrong_kex_guess_discarded() {
     let reply = io.read_unencrypted_packet(3).await.unwrap();
     assert_eq!(reply[5], 31);
     task.abort();
+    }
 }
 
 fn read_string<'a>(data: &mut &'a [u8]) -> &'a [u8] {
@@ -329,3 +331,64 @@ async fn x25519_client_disconnects_wrong_length_peer() {
     }
 }
 
+#[tokio::test]
+async fn no_common_algorithm_disconnect_reason() {
+    let (mut io, task) = start(HostKeyPair::generate_ed25519()).await;
+    io.read_unencrypted_packet(3).await.unwrap();
+    let mut offer = generate_client_kexinit_with_prefs(None, None, None);
+    replace_list(&mut offer, 0, "unknown-kex");
+    io.stream.write_all(&build_unencrypted_packet(&offer)).await.unwrap();
+    let response = io.read_unencrypted_packet(3).await.unwrap();
+    assert_eq!(response[5], 1);
+    assert_eq!(u32::from_be_bytes(response[6..10].try_into().unwrap()), 3);
+    task.await.unwrap();
+}
+
+#[tokio::test]
+async fn initial_parser_requires_kexinit() {
+    let (mut io, task) = start(HostKeyPair::generate_ed25519()).await;
+    io.read_unencrypted_packet(3).await.unwrap();
+    let offer = generate_client_kexinit_with_prefs(None, None, None);
+    io.stream.write_all(&build_unencrypted_packet(&[2])).await.unwrap();
+    io.stream.write_all(&build_unencrypted_packet(&offer)).await.unwrap();
+    assert!(io.read_unencrypted_packet(3).await.is_err());
+    task.await.unwrap();
+}
+
+#[tokio::test]
+async fn plaintext_supported_size_and_buffering() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut sender = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+    let (receiver, _) = listener.accept().await.unwrap();
+    let packet = build_unencrypted_packet(&vec![2; 34986]);
+    assert_eq!(packet.len(), 35000);
+    let next = build_unencrypted_packet(&[21]);
+    let mut combined = packet.clone();
+    combined.extend_from_slice(&next);
+    let write = tokio::spawn(async move { sender.write_all(&combined).await.unwrap(); });
+    let mut io = ServerEncryptedIO::new(receiver);
+    assert_eq!(io.read_unencrypted_packet(3).await.unwrap(), packet);
+    assert_eq!(io.read_unencrypted_packet(3).await.unwrap(), next);
+    write.await.unwrap();
+}
+
+#[test]
+fn directional_cipher_key_sizes() {
+    let mut ctx = KexContext::new(KexAlgorithm::Curve25519Sha256);
+    ctx.shared_secret = Some(vec![1; 32]);
+    let hash = vec![2; 32];
+    let mut offer = generate_client_kexinit_with_prefs(None, None, None);
+    replace_list(&mut offer, 2, "aes128-cbc");
+    replace_list(&mut offer, 3, "aes256-gcm@openssh.com");
+    replace_list(&mut offer, 4, "hmac-sha2-256");
+    replace_list(&mut offer, 5, "hmac-sha2-512");
+    let proposal = ayssh::transport::handshake::parse_server_kexinit(&offer).unwrap();
+    let selected = ayssh::transport::handshake::negotiate_algorithms(&proposal, &proposal).unwrap();
+    let keys = ctx.derive_session_keys_directional(&hash, &selected).unwrap();
+    assert_eq!(keys.enc_key_c2s.len(), 16);
+    assert_eq!(keys.enc_key_s2c.len(), 32);
+    assert_eq!(keys.client_iv.len(), 16);
+    assert_eq!(keys.server_iv.len(), 12);
+    assert_eq!(keys.mac_key_c2s.len(), 32);
+    assert_eq!(keys.mac_key_s2c.len(), 64);
+}
