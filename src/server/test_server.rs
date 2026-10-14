@@ -297,7 +297,7 @@ pub async fn server_handshake_with_auth(
     debug!("Session ID computed ({} bytes)", session_id.len());
 
     // Sign the exchange hash with the host key
-    let signature = host_key.sign(&session_id)?;
+    let signature = host_key.sign_with_algorithm(&session_id, &negotiated.host_key)?;
     debug!("Exchange hash signed ({} bytes)", signature.len());
 
     // Build KEXDH_REPLY: msg_type(31) || string(K_S) || mpint(f) || string(sig)
