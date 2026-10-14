@@ -239,6 +239,7 @@ impl Transport {
             // Check if we have enough data to determine the packet length
             if data.len() >= 4 {
                 let packet_len = u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize;
+                crate::transport::validate_plaintext_header(packet_len, data.get(4).copied())?;
                 let total_needed = 4 + packet_len;
                 if data.len() >= total_needed {
                     // We have a complete packet. Split off any extra bytes for next read.
@@ -1631,4 +1632,49 @@ mod tests {
             assert_eq!(id2, 2);
         });
     }
+}
+#[cfg(test)]
+mod plaintext_framing_tests {
+    use super::*;
+    use tokio::io::AsyncWriteExt;
+
+    async fn check(bytes: &[u8]) {
+        for server_side in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut sender = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+            let (receiver, _) = listener.accept().await.unwrap();
+            sender.write_all(bytes).await.unwrap();
+            let result = tokio::time::timeout(std::time::Duration::from_millis(100), async {
+                if server_side {
+                    crate::server::encrypted_io::ServerEncryptedIO::new(receiver).read_unencrypted_packet(30).await
+                } else {
+                    Transport::new(receiver).read_unencrypted_packet(30).await
+                }
+            }).await;
+            assert!(matches!(result, Ok(Err(_))), "invalid framing must fail promptly on server_side={server_side}");
+        }
+    }
+
+    #[tokio::test]
+    async fn plaintext_length_bounded() { check(&0xfffffffcu32.to_be_bytes()).await; }
+    #[tokio::test]
+    async fn plaintext_alignment_required() { check(&13u32.to_be_bytes()).await; }
+    #[tokio::test]
+    async fn plaintext_min_padding() {
+        let mut packet = vec![0,0,0,12,3,20]; packet.resize(16, 0);
+        check(&packet).await;
+    }
+}
+
+/// Validate plaintext framing before reading or allocating the packet body.
+pub(crate) fn validate_plaintext_header(length: usize, padding: Option<u8>) -> Result<(), crate::error::SshError> {
+    if length < 12 || length > 35000 || (length + 4) % 8 != 0 {
+        return Err(crate::error::SshError::ProtocolError("Invalid plaintext packet length or alignment".into()));
+    }
+    if let Some(padding) = padding {
+        if padding < 4 || padding as usize + 1 >= length {
+            return Err(crate::error::SshError::ProtocolError("Invalid plaintext padding".into()));
+        }
+    }
+    Ok(())
 }

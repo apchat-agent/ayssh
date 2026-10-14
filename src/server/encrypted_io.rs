@@ -69,6 +69,7 @@ impl ServerEncryptedIO {
         loop {
             if data.len() >= 4 {
                 let packet_len = u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize;
+                crate::transport::validate_plaintext_header(packet_len, data.get(4).copied())?;
                 let total_needed = 4 + packet_len;
                 if data.len() >= total_needed {
                     let remainder = data.split_off(total_needed);
