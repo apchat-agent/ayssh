@@ -488,6 +488,9 @@ impl Transport {
         self.send_sequence_number = self.send_sequence_number.wrapping_add(1);
         
         // 10. Receive KEXDH_REPLY from server using buffered packet reader
+        if handshake::wrong_kex_guess(&server_proposal, &negotiated) {
+            self.read_unencrypted_packet(30).await?;
+        }
         let reply_bytes = self.read_unencrypted_packet(30).await?;
         debug!("Successfully received KEXDH_REPLY packet ({} bytes)", reply_bytes.len());
         

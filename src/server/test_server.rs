@@ -218,6 +218,11 @@ pub async fn server_handshake_with_auth(
     );
     kex_context.set_server_host_key(&host_key.public_key_blob());
 
+    if crate::transport::handshake::wrong_kex_guess(&client_proposal, &negotiated) {
+        io.read_unencrypted_packet(30).await?;
+        recv_seq += 1;
+    }
+
     // Receive KEXDH_INIT (message type 30)
     let kexdh_init_packet = io.read_unencrypted_packet(30).await?;
     recv_seq += 1;
