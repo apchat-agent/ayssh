@@ -230,6 +230,24 @@ async fn nist_protected_packets() {
     }
 }
 
+#[tokio::test]
+async fn server_offers_loaded_host_key_only() {
+    for (key, expected) in [
+        (HostKeyPair::generate_ed25519(), vec!["ssh-ed25519"]),
+        (HostKeyPair::generate_rsa(1024).unwrap(), vec!["rsa-sha2-512", "rsa-sha2-256", "ssh-rsa"]),
+        (HostKeyPair::generate_ecdsa_p256(), vec!["ecdsa-sha2-nistp256"]),
+        (HostKeyPair::generate_ecdsa_p384(), vec!["ecdsa-sha2-nistp384"]),
+        (HostKeyPair::generate_ecdsa_p521(), vec!["ecdsa-sha2-nistp521"]),
+    ] {
+        let (mut io, task) = start(key).await;
+        let packet = io.read_unencrypted_packet(3).await.unwrap();
+        let end = packet.len() - packet[4] as usize;
+        let proposal = ayssh::transport::handshake::parse_server_kexinit(&packet[5..end]).unwrap();
+        assert_eq!(proposal.server_host_key_algorithms, expected);
+        task.abort();
+    }
+}
+
 fn assert_kex_disconnect(packet: &[u8]) {
     assert_eq!(packet[5], 1, "expected SSH_MSG_DISCONNECT before any KEX reply or NEWKEYS");
     assert_eq!(u32::from_be_bytes(packet[6..10].try_into().unwrap()), 3);
@@ -261,9 +279,9 @@ async fn invalid_server_key_disconnect(public: &[u8]) {
     io.stream.write_all(b"SSH-2.0-regression\r\n").await.unwrap();
     recv_version(&mut io.stream).await.unwrap();
     io.read_unencrypted_packet(3).await.unwrap();
-    let mut offer = generate_client_kexinit_with_prefs(Some("curve25519-sha256"), None, None);
+    let mut offer = ayssh::transport::handshake::generate_server_kexinit_with_prefs(
+        Some("curve25519-sha256"), None, None, &["ssh-ed25519"]);
     replace_list(&mut offer, 0, "curve25519-sha256");
-    replace_list(&mut offer, 1, "ssh-ed25519");
     io.stream.write_all(&build_unencrypted_packet(&offer)).await.unwrap();
     assert_eq!(io.read_unencrypted_packet(3).await.unwrap()[5], 30);
     let host_key = HostKeyPair::generate_ed25519().public_key_blob();

@@ -104,6 +104,17 @@ impl HostKeyPair {
         }
     }
 
+    /// Host-key algorithms available with this loaded key.
+    pub fn supported_algorithms(&self) -> &'static [&'static str] {
+        match self {
+            Self::Rsa(_) => &["rsa-sha2-512", "rsa-sha2-256", "ssh-rsa"],
+            Self::Ed25519(_) => &["ssh-ed25519"],
+            Self::Ecdsa(EcdsaCurve::Nistp256, _) => &["ecdsa-sha2-nistp256"],
+            Self::Ecdsa(EcdsaCurve::Nistp384, _) => &["ecdsa-sha2-nistp384"],
+            Self::Ecdsa(EcdsaCurve::Nistp521, _) => &["ecdsa-sha2-nistp521"],
+        }
+    }
+
     /// Encode the public key in SSH wire format (for KEXDH_REPLY K_S field)
     /// Format: string(algorithm_name) || key-specific-data
     pub fn public_key_blob(&self) -> Vec<u8> {
