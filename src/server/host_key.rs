@@ -166,6 +166,16 @@ impl HostKeyPair {
     /// For KEXDH_REPLY, the data is the exchange hash H.
     /// Returns: string(algorithm) || string(signature_blob)
     pub fn sign(&self, data: &[u8]) -> Result<Vec<u8>, SshError> {
+        self.sign_with_algorithm(data, self.algorithm_name())
+    }
+
+    /// Sign H with the host-key algorithm selected during negotiation.
+    pub fn sign_with_algorithm(&self, data: &[u8], algorithm: &str) -> Result<Vec<u8>, SshError> {
+        let valid = algorithm == self.algorithm_name() ||
+            (matches!(self, Self::Rsa(_)) && matches!(algorithm, "rsa-sha2-256" | "rsa-sha2-512"));
+        if !valid {
+            return Err(SshError::CryptoError("Host key cannot sign with negotiated algorithm".into()));
+        }
         let mut buf = BytesMut::new();
         match self {
             Self::Ed25519(signing_key) => {
@@ -180,15 +190,16 @@ impl HostKeyPair {
                 buf.put_slice(&sig_bytes);
             }
             Self::Rsa(private_key) => {
-                // ssh-rsa uses PKCS1v15 with SHA-1
                 use sha1::Digest;
-                let hash = sha1::Sha1::digest(data);
                 use rsa::Pkcs1v15Sign;
-                let scheme = Pkcs1v15Sign::new::<sha1::Sha1>();
+                let (scheme, hash) = match algorithm {
+                    "rsa-sha2-256" => (Pkcs1v15Sign::new::<sha2::Sha256>(), sha2::Sha256::digest(data).to_vec()),
+                    "rsa-sha2-512" => (Pkcs1v15Sign::new::<sha2::Sha512>(), sha2::Sha512::digest(data).to_vec()),
+                    _ => (Pkcs1v15Sign::new::<sha1::Sha1>(), sha1::Sha1::digest(data).to_vec()),
+                };
                 let sig_bytes = private_key.sign(scheme, &hash)
                     .map_err(|e| SshError::CryptoError(format!("RSA signing failed: {}", e)))?;
-
-                let algorithm = b"ssh-rsa";
+                let algorithm = algorithm.as_bytes();
                 buf.put_u32(algorithm.len() as u32);
                 buf.put_slice(algorithm);
                 buf.put_u32(sig_bytes.len() as u32);
