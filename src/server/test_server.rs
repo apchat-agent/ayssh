@@ -373,6 +373,19 @@ pub async fn server_handshake_with_auth(
     });
     info!("Encryption established: enc={}, mac={}", negotiated.enc_c2s, negotiated.mac_c2s);
 
+    // RFC 8308 sections 2.3 and 3.1: the client marker permits a server extension message.
+    if client_proposal.kex_algorithms.iter().any(|a| a == "ext-info-c") {
+        let algorithms = b"ssh-ed25519,rsa-sha2-512,rsa-sha2-256,ssh-rsa,ecdsa-sha2-nistp256,ecdsa-sha2-nistp384,ecdsa-sha2-nistp521";
+        let mut extensions = BytesMut::new();
+        extensions.put_u8(7); // SSH_MSG_EXT_INFO
+        extensions.put_u32(1);
+        extensions.put_u32(15);
+        extensions.put_slice(b"server-sig-algs");
+        extensions.put_u32(algorithms.len() as u32);
+        extensions.put_slice(algorithms);
+        io.send_message(&extensions).await?;
+    }
+
     // Step 7: Handle SERVICE_REQUEST
     let service_req = io.recv_message().await?;
     if service_req.is_empty() || service_req[0] != 5 {
