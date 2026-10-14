@@ -439,6 +439,16 @@ impl KexContext {
         self.derive_session_keys_for(hash, None, None)
     }
 
+    /// Derive each direction from its own negotiated cipher and MAC.
+    pub fn derive_session_keys_directional(&mut self, hash: &[u8], algorithms: &protocol::NegotiatedAlgorithms) -> anyhow::Result<SessionKeys> {
+        let mut keys = self.derive_session_keys_for(hash, Some(&algorithms.enc_c2s), Some(&algorithms.mac_c2s))?;
+        let outgoing = self.derive_session_keys_for(hash, Some(&algorithms.enc_s2c), Some(&algorithms.mac_s2c))?;
+        keys.enc_key_s2c = outgoing.enc_key_s2c;
+        keys.mac_key_s2c = outgoing.mac_key_s2c;
+        keys.server_iv = outgoing.server_iv;
+        Ok(keys)
+    }
+
     /// Derive session keys with explicit negotiated algorithm info.
     /// Key lengths are determined by the actual negotiated cipher and MAC,
     /// not by the KEX algorithm (which only determines the hash function).
