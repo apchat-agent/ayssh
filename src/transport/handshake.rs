@@ -93,6 +93,17 @@ pub fn generate_client_kexinit_with_prefs(
     preferred_cipher: Option<&str>,
     preferred_mac: Option<&str>,
 ) -> Vec<u8> {
+    generate_client_kexinit_with_x509(preferred_kex, preferred_cipher, preferred_mac, false)
+}
+
+/// Generate a proposal with optional RFC 6187 RSA certificate host keys.
+/// When enabled, prefer the certificate algorithm; defaults remain unchanged.
+pub fn generate_client_kexinit_with_x509(
+    preferred_kex: Option<&str>,
+    preferred_cipher: Option<&str>,
+    preferred_mac: Option<&str>,
+    enable_x509: bool,
+) -> Vec<u8> {
     let mut buf = BytesMut::with_capacity(200);
 
     buf.put_u8(20);
@@ -110,6 +121,13 @@ pub fn generate_client_kexinit_with_prefs(
     };
     let kex_algorithms = &kex_list;
     let host_key_algorithms = "ssh-rsa,ssh-dss,ecdsa-sha2-nistp256,ecdsa-sha2-nistp384,ecdsa-sha2-nistp521,ssh-ed25519,rsa-sha2-512,rsa-sha2-256";
+
+    let host_key_list = if enable_x509 {
+        format!("x509v3-ssh-rsa,{}", host_key_algorithms)
+    } else {
+        host_key_algorithms.to_string()
+    };
+    let host_key_algorithms = &host_key_list;
 
     let default_ciphers = "aes128-cbc,aes192-cbc,aes256-cbc,aes128-ctr,aes192-ctr,aes256-ctr,aes128-gcm@openssh.com,aes256-gcm@openssh.com,chacha20-poly1305@openssh.com";
     let default_macs = "hmac-sha1,hmac-sha2-256,hmac-sha2-512,hmac-sha1-etm@openssh.com,hmac-sha2-256-etm@openssh.com,hmac-sha2-512-etm@openssh.com";

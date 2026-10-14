@@ -106,3 +106,6 @@ mod tests {
         assert!(result.is_ok());
     }
 }
+
+/// RFC 6187 certificate host keys (client-side, fingerprint trust only).
+pub mod x509;

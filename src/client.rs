@@ -10,6 +10,7 @@ use tokio::net::TcpStream;
 /// SSH Client for connecting to remote servers
 pub struct SshClient {
     host: String,
+    enable_x509: bool,
     port: u16,
     /// Username for authentication
     username: Option<String>,
@@ -38,6 +39,7 @@ impl SshClient {
     pub fn new(host: String, port: u16) -> Self {
         Self {
             host,
+            enable_x509: false,
             port,
             username: None,
             password: None,
@@ -48,6 +50,12 @@ impl SshClient {
                 ProtocolAuthMethod::None,
             ],
         }
+    }
+
+    /// Enable RFC 6187 certificate host key negotiation (off by default).
+    pub fn with_x509_host_keys(mut self, enabled: bool) -> Self {
+        self.enable_x509 = enabled;
+        self
     }
 
     /// Get the host
@@ -108,7 +116,10 @@ impl SshClient {
         let stream = TcpStream::connect(&addr).await
             .map_err(|e| SshError::ConnectionError(format!("Failed to connect: {}", e)))?;
 
-        Ok(Transport::new(stream))
+        let mut transport = Transport::new(stream);
+        transport.set_remote_host(&self.host, self.port);
+        transport.set_x509_host_keys(self.enable_x509);
+        Ok(transport)
     }
 
     /// Connect with authentication
