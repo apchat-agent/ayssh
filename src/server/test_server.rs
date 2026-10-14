@@ -164,6 +164,7 @@ pub async fn server_handshake_with_auth(
         filter.kex.as_deref(),
         filter.cipher.as_deref(),
         filter.mac.as_deref(),
+        host_key.supported_algorithms(),
     );
     let server_kexinit_packet = build_unencrypted_packet(&server_kexinit);
     io.stream.write_all(&server_kexinit_packet).await?;

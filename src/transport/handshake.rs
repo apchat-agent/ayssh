@@ -324,12 +324,20 @@ pub fn parse_server_kexinit(data: &[u8]) -> Result<protocol::AlgorithmProposal, 
 }
 
 /// Generate a server proposal with the OpenSSH strict KEX server marker.
-pub fn generate_server_kexinit_with_prefs(kex: Option<&str>, cipher: Option<&str>, mac: Option<&str>) -> Vec<u8> {
+pub fn generate_server_kexinit_with_prefs(kex: Option<&str>, cipher: Option<&str>, mac: Option<&str>, host_algorithms: &[&str]) -> Vec<u8> {
     let mut payload = generate_client_kexinit_with_prefs(kex, cipher, mac);
     let marker = b"kex-strict-c-v00@openssh.com";
     if let Some(offset) = payload.windows(marker.len()).position(|w| w == marker) {
         payload[offset + 11] = b's';
     }
+    // The second name-list must describe keys that the server can actually use.
+    let kex_length = u32::from_be_bytes(payload[17..21].try_into().unwrap()) as usize;
+    let offset = 21 + kex_length;
+    let old_length = u32::from_be_bytes(payload[offset..offset+4].try_into().unwrap()) as usize;
+    let host_list = host_algorithms.join(",");
+    let mut encoded = (host_list.len() as u32).to_be_bytes().to_vec();
+    encoded.extend_from_slice(host_list.as_bytes());
+    payload.splice(offset..offset + 4 + old_length, encoded);
     payload
 }
 
