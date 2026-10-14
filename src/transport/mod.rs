@@ -585,12 +585,19 @@ impl Transport {
             let host_key_len = u32::from_be_bytes([reply_data[0], reply_data[1], reply_data[2], reply_data[3]]) as usize;
             if reply_data.len() >= 4 + host_key_len {
                 let after_host_key = &reply_data[4+host_key_len..];
-                kex_context.process_server_kex_init(after_host_key)?;
+                if let Err(error) = kex_context.process_server_kex_init(after_host_key) {
+                    crate::transport::handshake::disconnect_kex_failed(&mut self.stream).await;
+                    return Err(error.into());
+                }
             }
         }
         
         // 11. Compute shared secret (and session ID)
-        kex_context.compute_shared_secret()?;
+        if let Err(error) = kex_context.compute_shared_secret() {
+            // RFC 8731 section 3 defines an invalid peer key abort as a disconnect.
+            crate::transport::handshake::disconnect_kex_failed(&mut self.stream).await;
+            return Err(error.into());
+        }
         
         if negotiated.host_key == crate::x509::ALGORITHM {
             let (host_key, signature) = crate::x509::parse_kex_reply(reply_data)?;

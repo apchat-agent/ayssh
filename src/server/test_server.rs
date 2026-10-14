@@ -252,7 +252,10 @@ pub async fn server_handshake_with_auth(
     let mut client_e_for_kex = Vec::with_capacity(4 + client_e.len());
     client_e_for_kex.extend_from_slice(&(client_e.len() as u32).to_be_bytes());
     client_e_for_kex.extend_from_slice(client_e);
-    kex_context.process_server_kex_init(&client_e_for_kex)?;
+    if let Err(error) = kex_context.process_server_kex_init(&client_e_for_kex) {
+        crate::transport::handshake::disconnect_kex_failed(&mut io.stream).await;
+        return Err(error.into());
+    }
 
     // For the exchange hash, swap client/server ephemeral keys:
     // client_ephemeral in KexContext = server's key (f), but for hash we need it as client's (e)
@@ -274,7 +277,11 @@ pub async fn server_handshake_with_auth(
     });
 
     // Compute shared secret and session ID
-    kex_context.compute_shared_secret()?;
+    if let Err(error) = kex_context.compute_shared_secret() {
+        // RFC 8731 section 3 defines an invalid peer key abort as a disconnect.
+        crate::transport::handshake::disconnect_kex_failed(&mut io.stream).await;
+        return Err(error.into());
+    }
     let session_id = kex_context.session_id.clone().unwrap();
     debug!("Session ID computed ({} bytes)", session_id.len());
 

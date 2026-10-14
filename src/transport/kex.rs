@@ -251,7 +251,16 @@ impl KexContext {
                 // For ECDH, compute shared secret using elliptic curve multiplication
                 if let (Some(ref keypair), Some(ref server_pub)) = 
                     (&self.client_ecdh_keypair, &self.server_ecdh_public) {
+                    if self.algorithm == protocol::KexAlgorithm::Curve25519Sha256 && server_pub.len() != 32 {
+                        return Err(anyhow::anyhow!("Invalid X25519 public key length"));
+                    }
                     let shared = keypair.compute_shared_secret(server_pub);
+                    if self.algorithm == protocol::KexAlgorithm::Curve25519Sha256 {
+                        use subtle::ConstantTimeEq;
+                        if bool::from(shared.as_slice().ct_eq(&[0u8; 32])) {
+                            return Err(anyhow::anyhow!("Non-contributory X25519 shared secret"));
+                        }
+                    }
                     self.shared_secret = Some(shared);
                 } else {
                     return Err(anyhow::anyhow!("Missing ECDH keypair or server public key"));
@@ -650,6 +659,16 @@ mod tests {
     use rand::rngs::OsRng;
     use crate::crypto::dh::{DhGroup, Mpint};
     use num_bigint::BigUint;
+
+    #[test]
+    fn x25519_zero_secret() {
+        let mut ctx = KexContext::new(protocol::KexAlgorithm::Curve25519Sha256);
+        ctx.generate_client_key(&mut rand::rngs::OsRng).unwrap();
+        ctx.server_ecdh_public = Some(vec![0; 32]);
+        assert!(ctx.compute_shared_secret().is_err());
+        assert!(ctx.shared_secret.is_none());
+        assert!(ctx.session_id.is_none());
+    }
 
     #[test]
     fn test_kex_context_creation() {
