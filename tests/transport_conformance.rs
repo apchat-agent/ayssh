@@ -114,6 +114,76 @@ async fn server_advertises_kex_strict() {
     task.abort();
 }
 
+async fn exchange(kex_list: &str, mac_c2s: &str, mac_s2c: &str) -> (ServerEncryptedIO, tokio::task::JoinHandle<()>, ayssh::transport::kex::SessionKeys) {
+    let (mut io, task) = start(HostKeyPair::generate_ed25519()).await;
+    let server_offer_packet = io.read_unencrypted_packet(3).await.unwrap();
+    let end = server_offer_packet.len() - server_offer_packet[4] as usize;
+    let server_offer = &server_offer_packet[5..end];
+    let mut offer = generate_client_kexinit_with_prefs(Some("curve25519-sha256"), Some("aes128-cbc"), Some(mac_c2s));
+    replace_list(&mut offer, 0, kex_list);
+    replace_list(&mut offer, 1, "ssh-ed25519");
+    replace_list(&mut offer, 4, mac_c2s);
+    replace_list(&mut offer, 5, mac_s2c);
+    io.stream.write_all(&build_unencrypted_packet(&offer)).await.unwrap();
+    let kex = kex_list.split(',').next().unwrap().parse().unwrap();
+    let mut ctx = KexContext::new(kex);
+    ctx.generate_client_key(&mut rand::rngs::OsRng).unwrap();
+    let public = ctx.client_ephemeral.clone().unwrap();
+    let mut init = vec![30];
+    init.extend_from_slice(&(public.len() as u32).to_be_bytes());
+    init.extend_from_slice(&public);
+    io.stream.write_all(&build_unencrypted_packet(&init)).await.unwrap();
+    let reply = io.read_unencrypted_packet(3).await.unwrap();
+    let end = reply.len() - reply[4] as usize;
+    let mut payload = &reply[6..end];
+    let host_key = read_string(&mut payload);
+    ctx.set_exchange_info(b"SSH-2.0-regression", b"SSH-2.0-ayssh_test_server", &offer, server_offer);
+    ctx.set_server_host_key(host_key);
+    ctx.process_server_kex_init(payload).unwrap();
+    ctx.compute_shared_secret().unwrap();
+    let hash = ctx.session_id.clone().unwrap();
+    let mut keys = ctx.derive_session_keys_for(&hash, Some("aes128-cbc"), Some(mac_c2s)).unwrap();
+    let outgoing = ctx.derive_session_keys_for(&hash, Some("aes128-cbc"), Some(mac_s2c)).unwrap();
+    keys.mac_key_s2c = outgoing.mac_key_s2c;
+    assert_eq!(io.read_unencrypted_packet(3).await.unwrap()[5], 21);
+    io.stream.write_all(&build_unencrypted_packet(&[21])).await.unwrap();
+    (io, task, keys)
+}
+
+async fn read_protected(io: &mut ServerEncryptedIO, keys: &ayssh::transport::kex::SessionKeys, mac: &str, sequence: u32) -> Vec<u8> {
+    let first = io.read_exact_buffered(16).await.unwrap();
+    let header = ayssh::crypto::cipher::aes_cbc_decrypt_raw(&keys.enc_key_s2c, &keys.server_iv, &first).unwrap();
+    let length = u32::from_be_bytes(header[..4].try_into().unwrap()) as usize;
+    let mut encrypted = first;
+    encrypted.extend_from_slice(&io.read_exact_buffered(length + 4 - 16).await.unwrap());
+    let plaintext = ayssh::crypto::cipher::aes_cbc_decrypt_raw(&keys.enc_key_s2c, &keys.server_iv, &encrypted).unwrap();
+    let (algorithm, size) = match mac {
+        "hmac-sha2-256" => (ring::hmac::HMAC_SHA256, 32),
+        "hmac-sha2-512" => (ring::hmac::HMAC_SHA512, 64),
+        _ => (ring::hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY, 20),
+    };
+    let tag = io.read_exact_buffered(size).await.unwrap();
+    let mut authenticated = sequence.to_be_bytes().to_vec();
+    authenticated.extend_from_slice(&plaintext);
+    ring::hmac::verify(&ring::hmac::Key::new(algorithm, &keys.mac_key_s2c), &authenticated, &tag).unwrap();
+    plaintext[5..plaintext.len()-plaintext[4] as usize].to_vec()
+}
+
+#[tokio::test]
+async fn ext_info_after_newkeys() {
+    let (mut io, task, keys) = exchange("curve25519-sha256,ext-info-c,kex-strict-c-v00@openssh.com", "hmac-sha1", "hmac-sha1").await;
+    let payload = tokio::time::timeout(std::time::Duration::from_millis(200), read_protected(&mut io, &keys, "hmac-sha1", 0)).await.unwrap();
+    assert_eq!(payload[0], 7);
+    assert_eq!(u32::from_be_bytes(payload[1..5].try_into().unwrap()), 1);
+    let mut fields = &payload[5..];
+    assert_eq!(read_string(&mut fields), b"server-sig-algs");
+    let algorithms = std::str::from_utf8(read_string(&mut fields)).unwrap();
+    assert!(algorithms.split(',').any(|a| a == "rsa-sha2-256"));
+    assert!(algorithms.split(',').any(|a| a == "ssh-ed25519"));
+    assert!(fields.is_empty());
+    task.abort();
+}
+
 fn assert_kex_disconnect(packet: &[u8]) {
     assert_eq!(packet[5], 1, "expected SSH_MSG_DISCONNECT before any KEX reply or NEWKEYS");
     assert_eq!(u32::from_be_bytes(packet[6..10].try_into().unwrap()), 3);
