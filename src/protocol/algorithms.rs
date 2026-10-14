@@ -193,6 +193,11 @@ impl AlgorithmProposal {
         };
 
         for algo in client_list {
+            // RFC 8308 section 2 and OpenSSH strict KEX markers are capabilities,
+            // never actual methods that can be selected for key exchange.
+            if category == "kex" && matches!(algo.as_str(), "ext-info-c" | "ext-info-s" | "kex-strict-c-v00@openssh.com" | "kex-strict-s-v00@openssh.com") {
+                continue;
+            }
             if server_list.contains(algo) {
                 return Some(algo.clone());
             }

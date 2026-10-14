@@ -426,8 +426,10 @@ impl Transport {
         }
 
         // 8. Negotiate algorithms
-        let negotiated = client_proposal.select_common_algorithms(&server_proposal)
-            .map_err(|e| crate::error::SshError::ProtocolError(e.to_string()))?;
+        let negotiated = match handshake::negotiate_algorithms(&client_proposal, &server_proposal) {
+            Ok(algorithms) => algorithms,
+            Err(error) => { handshake::disconnect_kex_failed(&mut self.stream).await; return Err(error); }
+        };
         debug!("Negotiated KEX algorithm: {}", negotiated.kex);
 
         // Store negotiated algorithms in handshake state
