@@ -36,6 +36,8 @@ use sha1::{Digest, Sha1};
 pub enum HashAlgorithm {
     Sha1,
     Sha256,
+    Sha384,
+    Sha512,
 }
 
 /// Derive cryptographic keys using the SSH KDF
@@ -88,6 +90,8 @@ pub fn kdf(
     let hash_len = match hash_algo {
         HashAlgorithm::Sha1 => 20,   // SHA-1 produces 20 bytes
         HashAlgorithm::Sha256 => 32, // SHA-256 produces 32 bytes
+        HashAlgorithm::Sha384 => 48,
+        HashAlgorithm::Sha512 => 64,
     };
     let num_blocks = (desired_length + hash_len - 1) / hash_len;
 
@@ -116,8 +120,13 @@ pub fn kdf(
 
                 hasher.finalize().to_vec()
             }
-            HashAlgorithm::Sha256 => {
-                let mut hasher = digest::Context::new(&SHA256);
+            HashAlgorithm::Sha256 | HashAlgorithm::Sha384 | HashAlgorithm::Sha512 => {
+                let algorithm = match hash_algo {
+                    HashAlgorithm::Sha384 => &digest::SHA384,
+                    HashAlgorithm::Sha512 => &digest::SHA512,
+                    _ => &SHA256,
+                };
+                let mut hasher = digest::Context::new(algorithm);
                 let k_mpint = crate::crypto::dh::Mpint::encode_length_prefixed(
                     &num_bigint::BigUint::from_bytes_be(shared_secret),
                 );

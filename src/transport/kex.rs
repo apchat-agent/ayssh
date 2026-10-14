@@ -493,6 +493,8 @@ impl KexContext {
             let hash_algo = match self.algorithm {
                 protocol::KexAlgorithm::DiffieHellmanGroup1Sha1 |
                 protocol::KexAlgorithm::DiffieHellmanGroup14Sha1 => kdf::HashAlgorithm::Sha1,
+                protocol::KexAlgorithm::EcdhSha2Nistp384 => kdf::HashAlgorithm::Sha384,
+                protocol::KexAlgorithm::EcdhSha2Nistp521 => kdf::HashAlgorithm::Sha512,
                 _ => kdf::HashAlgorithm::Sha256,
             };
             

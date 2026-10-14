@@ -1266,3 +1266,62 @@ fn test_sftp_client_large_upload_against_our_server() {
         eprintln!("[sftp_large_put] 2MB upload verified!");
     });
 }
+#[test]
+fn openssh_nist_kex() {
+    skip_if_no_ssh!();
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let ssh_path = find_ssh().unwrap();
+
+    let kex_algorithms = [
+        "ecdh-sha2-nistp384",
+        "ecdh-sha2-nistp521",
+    ];
+
+    let mut passed = 0;
+
+    for kex in &kex_algorithms {
+        eprint!("  kex={} ... ", kex);
+
+        let ssh_path = ssh_path.clone();
+        let kex = kex.to_string();
+
+        let result = std::panic::catch_unwind(move || {
+            run_server_test(
+                HostKeyPair::generate_ed25519(),
+                AlgorithmFilter { kex: None, cipher: None, mac: None },
+                move |port| {
+                    let mut args = ssh_base_args(port);
+                    args.extend([
+                        "-o".into(), format!("KexAlgorithms={}", kex),
+                        "-o".into(), "PreferredAuthentications=publickey".to_string(),
+                        "-i".into(), "tests/keys/test_ed25519".into(),
+                        "-l".into(), "testuser".into(),
+                        "127.0.0.1".into(),
+                        "cat".into(),
+                    ]);
+
+                    let output = Command::new(&ssh_path)
+                        .args(&args)
+                        .output()
+                        .expect("Failed to run ssh");
+
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    assert!(stdout.contains("INTEROP_OK"));
+                },
+            );
+        });
+
+        match result {
+            Ok(()) => {
+                passed += 1;
+                eprintln!("ok");
+            }
+            Err(_) => {
+                eprintln!("FAILED");
+            }
+        }
+    }
+
+    eprintln!("\n  Client KEX interop: {}/{} passed", passed, kex_algorithms.len());
+    assert_eq!(passed, kex_algorithms.len(), "Both NIST curves must work with OpenSSH");
+}
