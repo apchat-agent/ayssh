@@ -39,7 +39,6 @@ certificate/response. Certificates require valid DER and the leaf requires an
 RSA SubjectPublicKeyInfo. OCSP receives DER framing checks only.
 RFC 6187 section 3.2 requires an `ssh-rsa` PKCS#1 v1.5 / SHA-1 signature over
 the exchange hash, verified before accepting or persisting a certificate pin.
-(The brief's section references differ from the supplied RFC's numbering.)
 
 TODO: CA chain, validity, key usage, hostname identity, and revocation validation.
 Certificate acceptance currently means fingerprint trust, with no CA validation.
