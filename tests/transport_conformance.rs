@@ -194,6 +194,42 @@ async fn directional_mac_lengths() {
     }
 }
 
+#[test]
+fn nist_kdf_digest() {
+    for (algorithm, digest, hash_size) in [
+        (KexAlgorithm::EcdhSha2Nistp384, &ring::digest::SHA384, 48),
+        (KexAlgorithm::EcdhSha2Nistp521, &ring::digest::SHA512, 64),
+    ] {
+        let mut ctx = KexContext::new(algorithm);
+        ctx.shared_secret = Some(vec![1; 32]);
+        let hash = vec![2; hash_size];
+        let keys = ctx.derive_session_keys_for(&hash, Some("aes128-cbc"), Some("hmac-sha2-512")).unwrap();
+        let mut input = 32u32.to_be_bytes().to_vec();
+        input.extend_from_slice(&[1; 32]);
+        input.extend_from_slice(&hash);
+        let mut first = input.clone();
+        first.push(b'F');
+        first.extend_from_slice(&hash);
+        let mut expected = ring::digest::digest(digest, &first).as_ref().to_vec();
+        if expected.len() < 64 {
+            input.extend_from_slice(&expected);
+            expected.extend_from_slice(ring::digest::digest(digest, &input).as_ref());
+        }
+        expected.truncate(64);
+        assert_eq!(keys.mac_key_s2c, expected);
+    }
+}
+
+#[tokio::test]
+async fn nist_protected_packets() {
+    for curve in ["ecdh-sha2-nistp384", "ecdh-sha2-nistp521"] {
+        let list = format!("{curve},ext-info-c,kex-strict-c-v00@openssh.com");
+        let (mut io, task, keys) = exchange(&list, "hmac-sha2-512", "hmac-sha2-512").await;
+        assert_eq!(read_protected(&mut io, &keys, "hmac-sha2-512", 0).await[0], 7);
+        task.abort();
+    }
+}
+
 fn assert_kex_disconnect(packet: &[u8]) {
     assert_eq!(packet[5], 1, "expected SSH_MSG_DISCONNECT before any KEX reply or NEWKEYS");
     assert_eq!(u32::from_be_bytes(packet[6..10].try_into().unwrap()), 3);
