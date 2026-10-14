@@ -214,7 +214,7 @@ impl ServerEncryptedIO {
             mac_data.extend_from_slice(&encrypted);
             let expected_mac = compute_mac(&mac_algo, &ds.mac_key, &mac_data);
 
-            if expected_mac != received_mac {
+            if !crate::transport::verify_packet_mac(&expected_mac, &received_mac) {
                 return Err(SshError::ProtocolError("ETM MAC failed".to_string()));
             }
 
@@ -268,7 +268,7 @@ impl ServerEncryptedIO {
             mac_data.extend_from_slice(&decrypted);
             let expected_mac = compute_mac(&decrypt_state.mac_algorithm, &decrypt_state.mac_key, &mac_data);
 
-            if expected_mac.len() != received_mac.len() || !expected_mac.iter().zip(received_mac.iter()).all(|(a, b)| a == b) {
+            if !crate::transport::verify_packet_mac(&expected_mac, &received_mac) {
                 return Err(SshError::ProtocolError("MAC verification failed".to_string()));
             }
 

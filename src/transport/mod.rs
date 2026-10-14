@@ -905,7 +905,7 @@ impl Transport {
                 ds.mac_key.clone()
             }, &mac_data);
 
-            if expected_mac.len() != received_mac.len() || !expected_mac.iter().zip(received_mac.iter()).all(|(a, b)| a == b) {
+            if !crate::transport::verify_packet_mac(&expected_mac, &received_mac) {
                 return Err(crate::error::SshError::ProtocolError("ETM MAC verification failed".to_string()));
             }
             debug!("ETM MAC verification successful");
@@ -969,7 +969,7 @@ impl Transport {
             mac_data.extend_from_slice(&decrypted);
 
             let expected_mac = compute_mac(&decrypt_state.mac_algorithm, &decrypt_state.mac_key, &mac_data);
-            if expected_mac.len() != received_mac.len() || !expected_mac.iter().zip(received_mac.iter()).all(|(a, b)| a == b) {
+            if !crate::transport::verify_packet_mac(&expected_mac, &received_mac) {
                 return Err(crate::error::SshError::ProtocolError("MAC verification failed".to_string()));
             }
             debug!("MAC verification successful (seq={})", decrypt_state.sequence_number);
@@ -1681,4 +1681,27 @@ pub(crate) fn validate_plaintext_header(length: usize, padding: Option<u8>) -> R
         }
     }
     Ok(())
+}
+
+/// Compare fixed-length packet MACs without content-dependent early exits.
+pub(crate) fn verify_packet_mac(expected: &[u8], received: &[u8]) -> bool {
+    use subtle::ConstantTimeEq;
+    bool::from(expected.ct_eq(received))
+}
+
+#[cfg(test)]
+mod mac_compare_tests {
+    #[test]
+    fn mac_compare_all_mismatch_positions() {
+        for size in [20, 32, 64] {
+            let expected = vec![0x55; size];
+            assert!(super::verify_packet_mac(&expected, &expected));
+            for offset in 0..size {
+                let mut received = expected.clone();
+                received[offset] ^= 1;
+                assert!(!super::verify_packet_mac(&expected, &received));
+            }
+            assert!(!super::verify_packet_mac(&expected, &expected[..size-1]));
+        }
+    }
 }
