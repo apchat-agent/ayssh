@@ -340,11 +340,7 @@ pub async fn server_handshake_with_auth(
     }
 
     // Derive session keys
-    let session_keys = kex_context.derive_session_keys_for(
-        &session_id,
-        Some(&negotiated.enc_c2s),
-        Some(&negotiated.mac_c2s),
-    )?;
+    let session_keys = kex_context.derive_session_keys_directional(&session_id, &negotiated)?;
 
     if strict_kex {
         send_seq = 0;

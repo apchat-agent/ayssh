@@ -639,9 +639,7 @@ impl Transport {
         let session_id = kex_context.session_id.clone()
             .expect("Session ID not computed");
         self.session_id = Some(session_id.clone());
-        let enc_alg = self.handshake.enc_c2s.as_deref();
-        let mac_alg = self.handshake.mac_c2s.as_deref();
-        let session_keys = kex_context.derive_session_keys_for(&session_id, enc_alg, mac_alg)?;
+        let session_keys = kex_context.derive_session_keys_directional(&session_id, &negotiated)?;
         
         // Store session keys in handshake state
         self.handshake.session_keys = Some(session_keys);

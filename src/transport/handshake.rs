@@ -522,7 +522,7 @@ pub async fn perform_handshake<T: AsyncReadExt + AsyncWriteExt + Unpin>(
     // 10. Derive session keys
     let session_id = transport_session.session_id().cloned()
         .expect("Session ID not set");
-    transport_session.kex_context_mut().derive_session_keys(&session_id)?;
+    transport_session.kex_context_mut().derive_session_keys_directional(&session_id, &negotiated)?;
     
     // 11. Send NEWKEYS message to transition to encrypted mode
     let newkeys_msg = crate::transport::kex::encode_newkeys();

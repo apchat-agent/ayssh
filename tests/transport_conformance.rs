@@ -184,6 +184,16 @@ async fn ext_info_after_newkeys() {
     task.abort();
 }
 
+#[tokio::test]
+async fn directional_mac_lengths() {
+    for (incoming, outgoing) in [("hmac-sha2-256", "hmac-sha2-512"), ("hmac-sha2-512", "hmac-sha2-256")] {
+        let (mut io, task, keys) = exchange("curve25519-sha256,ext-info-c,kex-strict-c-v00@openssh.com", incoming, outgoing).await;
+        let payload = read_protected(&mut io, &keys, outgoing, 0).await;
+        assert_eq!(payload[0], 7);
+        task.abort();
+    }
+}
+
 fn assert_kex_disconnect(packet: &[u8]) {
     assert_eq!(packet[5], 1, "expected SSH_MSG_DISCONNECT before any KEX reply or NEWKEYS");
     assert_eq!(u32::from_be_bytes(packet[6..10].try_into().unwrap()), 3);
