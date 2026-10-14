@@ -112,7 +112,7 @@ pub fn generate_client_kexinit_with_x509(
     rand::rngs::OsRng.fill_bytes(&mut cookie);
     buf.put(&cookie[..]);
 
-    let default_kex = "diffie-hellman-group1-sha1,diffie-hellman-group14-sha1,diffie-hellman-group14-sha256,curve25519-sha256,ecdh-sha2-nistp256,ecdh-sha2-nistp384,ecdh-sha2-nistp521,kex-strict-c-v00@openssh.com";
+    let default_kex = "diffie-hellman-group14-sha1,diffie-hellman-group14-sha256,curve25519-sha256,ecdh-sha2-nistp256,ecdh-sha2-nistp384,ecdh-sha2-nistp521,kex-strict-c-v00@openssh.com";
     let kex_list = if let Some(pref) = preferred_kex {
         let others: Vec<&str> = default_kex.split(',').filter(|k| *k != pref).collect();
         format!("{},{}", pref, others.join(","))
@@ -554,6 +554,14 @@ mod tests {
     }
 
     #[test]
+    fn group1_requires_opt_in() {
+        let default = parse_server_kexinit(&generate_client_kexinit()).unwrap();
+        assert!(!default.kex_algorithms.iter().any(|a| a == "diffie-hellman-group1-sha1"));
+        let explicit = parse_server_kexinit(&generate_client_kexinit_with_prefs(Some("diffie-hellman-group1-sha1"), None, None)).unwrap();
+        assert_eq!(explicit.kex_algorithms[0], "diffie-hellman-group1-sha1");
+    }
+
+    #[test]
     fn no_common_algorithm_errors() {
         for category in 0..7 {
             let mut client = parse_server_kexinit(&generate_client_kexinit()).unwrap();
@@ -681,8 +689,8 @@ mod tests {
 
         // According to RFC 4253 Section 7.1: "The first algorithm in each list
         // that is also in the other's list is chosen."
-        // The client's KEX list starts with "diffie-hellman-group1-sha1"
-        assert_eq!(negotiated.kex, "diffie-hellman-group1-sha1");
+        // The default proposal omits the discouraged 1024-bit group.
+        assert_eq!(negotiated.kex, "diffie-hellman-group14-sha1");
         assert_eq!(negotiated.compression, "none");
     }
 
