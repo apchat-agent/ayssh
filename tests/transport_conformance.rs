@@ -26,6 +26,29 @@ async fn start(key: HostKeyPair) -> (ServerEncryptedIO, tokio::task::JoinHandle<
     (io, task)
 }
 
+#[tokio::test]
+async fn wrong_kex_guess_discarded() {
+    let (mut io, task) = start(HostKeyPair::generate_ed25519()).await;
+    io.read_unencrypted_packet(3).await.unwrap();
+    let mut offer = generate_client_kexinit_with_prefs(Some("curve25519-sha256"), None, None);
+    replace_list(&mut offer, 0, "unknown-kex,curve25519-sha256");
+    replace_list(&mut offer, 1, "ssh-ed25519");
+    let follows = offer.len() - 5;
+    offer[follows] = 1;
+    io.stream.write_all(&build_unencrypted_packet(&offer)).await.unwrap();
+    io.stream.write_all(&build_unencrypted_packet(&[200])).await.unwrap();
+    let mut ctx = KexContext::new(KexAlgorithm::Curve25519Sha256);
+    ctx.generate_client_key(&mut rand::rngs::OsRng).unwrap();
+    let public = ctx.client_ephemeral.unwrap();
+    let mut init = vec![30];
+    init.extend_from_slice(&(public.len() as u32).to_be_bytes());
+    init.extend_from_slice(&public);
+    io.stream.write_all(&build_unencrypted_packet(&init)).await.unwrap();
+    let reply = io.read_unencrypted_packet(3).await.unwrap();
+    assert_eq!(reply[5], 31);
+    task.abort();
+}
+
 fn assert_kex_disconnect(packet: &[u8]) {
     assert_eq!(packet[5], 1, "expected SSH_MSG_DISCONNECT before any KEX reply or NEWKEYS");
     assert_eq!(u32::from_be_bytes(packet[6..10].try_into().unwrap()), 3);

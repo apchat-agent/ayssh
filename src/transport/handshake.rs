@@ -351,6 +351,27 @@ pub(crate) async fn disconnect_kex_failed<T: AsyncWriteExt + Unpin>(stream: &mut
     let _ = stream.write_all(&crate::server::encrypted_io::build_unencrypted_packet(&payload)).await;
 }
 
+/// RFC 4253 section 7: guesses include both KEX and host key algorithms.
+pub(crate) fn wrong_kex_guess(proposal: &protocol::AlgorithmProposal, selected: &protocol::NegotiatedAlgorithms) -> bool {
+    proposal.first_kex_packet_follows &&
+        (proposal.kex_algorithms.first() != Some(&selected.kex) ||
+         proposal.server_host_key_algorithms.first() != Some(&selected.host_key))
+}
+
+pub(crate) async fn read_plaintext_payload<T: AsyncReadExt + Unpin>(stream: &mut T) -> Result<Vec<u8>, crate::error::SshError> {
+    let mut header = [0u8; 4];
+    stream.read_exact(&mut header).await?;
+    let length = u32::from_be_bytes(header) as usize;
+    crate::transport::validate_plaintext_header(length, None)?;
+    let mut pad = [0u8; 1];
+    stream.read_exact(&mut pad).await?;
+    crate::transport::validate_plaintext_header(length, Some(pad[0]))?;
+    let mut body = vec![0u8; length - 1];
+    stream.read_exact(&mut body).await?;
+    body.truncate(length - 1 - pad[0] as usize);
+    Ok(body)
+}
+
 /// Send SSH version string
 pub async fn send_version<T: AsyncWriteExt + Unpin>(stream: &mut T) -> Result<(), crate::error::SshError> {
     send_version_custom(stream, SSH_VERSION_STRING).await
@@ -443,18 +464,8 @@ pub async fn perform_handshake<T: AsyncReadExt + AsyncWriteExt + Unpin>(
     stream.write_all(&crate::server::encrypted_io::build_unencrypted_packet(&client_kexinit)).await?;
     
     // 4. Receive and parse server KEXINIT
-    let mut len_buf = [0u8; 4];
-    stream.read_exact(&mut len_buf).await?;
-    let len = u32::from_be_bytes(len_buf) as usize;
-    
-    crate::transport::validate_plaintext_header(len, None)?;
-    let mut pad = [0u8; 1];
-    stream.read_exact(&mut pad).await?;
-    crate::transport::validate_plaintext_header(len, Some(pad[0]))?;
-    let mut body = vec![0u8; len - 1];
-    stream.read_exact(&mut body).await?;
-    let server_kexinit_bytes = &body[..len - 1 - pad[0] as usize];
-    
+    let server_kexinit_bytes = read_plaintext_payload(&mut stream).await?;
+
     let server_proposal = parse_server_kexinit(&server_kexinit_bytes)
         .map_err(|e| crate::error::SshError::ProtocolError(e.to_string()))?;
     
@@ -466,6 +477,10 @@ pub async fn perform_handshake<T: AsyncReadExt + AsyncWriteExt + Unpin>(
         Err(error) => { disconnect_kex_failed(&mut stream).await; return Err(error); }
     };
     
+    if wrong_kex_guess(&server_proposal, &negotiated) {
+        read_plaintext_payload(&mut stream).await?;
+    }
+
     // 6. Create transport session and initiate KEX
     let mut transport_session = TransportSession::new(stream, KexAlgorithm::from_str(&negotiated.kex).unwrap_or(KexAlgorithm::Curve25519Sha256));
     transport_session.init_kex()?;
@@ -481,13 +496,8 @@ pub async fn perform_handshake<T: AsyncReadExt + AsyncWriteExt + Unpin>(
     transport_session.stream_mut().write_all(&kexinit_msg).await?;
     
     // 8. Receive KEX_REPLY from server (server ephemeral key)
-    let mut len_buf2 = [0u8; 4];
-    transport_session.stream_mut().read_exact(&mut len_buf2).await?;
-    let len2 = u32::from_be_bytes(len_buf2) as usize;
-    
-    let mut reply_bytes = vec![0u8; len2];
-    transport_session.stream_mut().read_exact(&mut reply_bytes).await?;
-    
+    let reply_bytes = read_plaintext_payload(transport_session.stream_mut()).await?;
+
     if reply_bytes[0] != protocol::MessageType::KexInit as u8 {
         return Err(crate::error::SshError::ProtocolError(
             "Expected KEX_INIT from server".to_string()
@@ -509,21 +519,11 @@ pub async fn perform_handshake<T: AsyncReadExt + AsyncWriteExt + Unpin>(
     transport_session.stream_mut().write_all(&newkeys_msg).await?;
     
     // 12. Receive NEWKEYS from server
-    let mut len_buf3 = [0u8; 4];
-    transport_session.stream_mut().read_exact(&mut len_buf3).await?;
-    let len3 = u32::from_be_bytes(len_buf3) as usize;
-    
-    let mut newkeys_bytes = vec![0u8; len3];
-    transport_session.stream_mut().read_exact(&mut newkeys_bytes).await?;
-    
-    // newkeys_bytes contains: [padding_length (1 byte)][payload][padding]
-    // The message type is at byte 1 (after padding_length byte)
-    if newkeys_bytes.len() < 2 || newkeys_bytes[1] != protocol::MessageType::Newkeys as u8 {
-        return Err(crate::error::SshError::ProtocolError(
-            "Expected NEWKEYS from server".to_string()
-        ));
+    let newkeys_bytes = read_plaintext_payload(transport_session.stream_mut()).await?;
+    if newkeys_bytes.as_slice() != [protocol::MessageType::Newkeys as u8] {
+        return Err(crate::error::SshError::ProtocolError("Expected NEWKEYS from server".into()));
     }
-    
+
     // 13. Transition to encrypted state
     transport_session.transition_to_encrypted()?;
     
