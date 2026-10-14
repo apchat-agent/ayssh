@@ -367,6 +367,39 @@ pub fn negotiate_algorithms(client: &protocol::AlgorithmProposal, server: &proto
     }
 }
 
+/// RFC 4253 section 11.1: terminate unsuccessful algorithm negotiation.
+pub(crate) async fn disconnect_kex_failed<T: AsyncWriteExt + Unpin>(stream: &mut T) {
+    let mut payload = BytesMut::new();
+    payload.put_u8(1);
+    payload.put_u32(3); // SSH_DISCONNECT_KEY_EXCHANGE_FAILED
+    let description = b"Key exchange negotiation failed";
+    payload.put_u32(description.len() as u32);
+    payload.put_slice(description);
+    payload.put_u32(0); // language tag
+    let _ = stream.write_all(&crate::server::encrypted_io::build_unencrypted_packet(&payload)).await;
+}
+
+/// RFC 4253 section 7: guesses include both KEX and host key algorithms.
+pub(crate) fn wrong_kex_guess(proposal: &protocol::AlgorithmProposal, selected: &protocol::NegotiatedAlgorithms) -> bool {
+    proposal.first_kex_packet_follows &&
+        (proposal.kex_algorithms.first() != Some(&selected.kex) ||
+         proposal.server_host_key_algorithms.first() != Some(&selected.host_key))
+}
+
+pub(crate) async fn read_plaintext_payload<T: AsyncReadExt + Unpin>(stream: &mut T) -> Result<Vec<u8>, crate::error::SshError> {
+    let mut header = [0u8; 4];
+    stream.read_exact(&mut header).await?;
+    let length = u32::from_be_bytes(header) as usize;
+    crate::transport::validate_plaintext_header(length, None)?;
+    let mut pad = [0u8; 1];
+    stream.read_exact(&mut pad).await?;
+    crate::transport::validate_plaintext_header(length, Some(pad[0]))?;
+    let mut body = vec![0u8; length - 1];
+    stream.read_exact(&mut body).await?;
+    body.truncate(length - 1 - pad[0] as usize);
+    Ok(body)
+}
+
 /// Send SSH version string
 pub async fn send_version<T: AsyncWriteExt + Unpin>(stream: &mut T) -> Result<(), crate::error::SshError> {
     send_version_custom(stream, SSH_VERSION_STRING).await
