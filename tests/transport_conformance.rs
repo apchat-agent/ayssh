@@ -248,6 +248,16 @@ async fn server_offers_loaded_host_key_only() {
     }
 }
 
+#[test]
+fn mac_compare_receivers_use_constant_time_comparison() {
+    // Guard the security-sensitive receive sites against early-exit comparisons.
+    for source in [include_str!("../src/transport/mod.rs"), include_str!("../src/server/encrypted_io.rs")] {
+        assert!(!source.contains("expected_mac.iter().zip"));
+        assert!(!source.contains("expected_mac != received_mac"));
+        assert!(source.matches("verify_packet_mac(&expected_mac,").count() >= 2);
+    }
+}
+
 fn assert_kex_disconnect(packet: &[u8]) {
     assert_eq!(packet[5], 1, "expected SSH_MSG_DISCONNECT before any KEX reply or NEWKEYS");
     assert_eq!(u32::from_be_bytes(packet[6..10].try_into().unwrap()), 3);
