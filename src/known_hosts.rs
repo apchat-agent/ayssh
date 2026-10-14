@@ -10,6 +10,8 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 /// Host key types supported by SSH
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum HostKeyType {
+    /// RFC 6187 RSA certificate: key_data contains its 32-byte SHA-256 digest.
+    X509Rsa,
     /// RSA keys (ssh-rsa)
     Rsa,
     /// ECDSA keys (ecdsa-sha2-nistp256/384/521)
@@ -22,6 +24,7 @@ impl HostKeyType {
     /// Get the SSH algorithm string for this key type
     pub fn key_type_str(&self) -> &'static str {
         match self {
+            HostKeyType::X509Rsa => "x509v3-ssh-rsa",
             HostKeyType::Rsa => "ssh-rsa",
             HostKeyType::Ecdsa => "ecdsa-sha2-nistp256",
             HostKeyType::Ed25519 => "ssh-ed25519",
@@ -31,6 +34,7 @@ impl HostKeyType {
     /// Parse a key type from an SSH algorithm string
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
+            "x509v3-ssh-rsa" => Some(HostKeyType::X509Rsa),
             "ssh-rsa" => Some(HostKeyType::Rsa),
             "ecdsa-sha2-nistp256" | "ecdsa-sha2-nistp384" | "ecdsa-sha2-nistp521" => {
                 Some(HostKeyType::Ecdsa)

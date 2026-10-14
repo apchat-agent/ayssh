@@ -98,6 +98,14 @@ impl RsaSignatureEncoder {
         Ok(SshSignature::new(SSH_SIG_ALGORITHM_RSA, signature))
     }
 
+    /// Verify an ssh-rsa PKCS#1 v1.5 / SHA-1 signature, also used by RFC 6187.
+    pub fn verify(public_key: &rsa::RsaPublicKey, data: &[u8], signature: &[u8]) -> Result<(), SshError> {
+        use sha1::Digest;
+        public_key.verify(rsa::Pkcs1v15Sign::new::<sha1::Sha1>(),
+            &sha1::Sha1::digest(data), signature)
+            .map_err(|e| SshError::CryptoError(format!("RSA signature verification failed: {}", e)))
+    }
+
     /// Encode RSA signature using SHA-256 (rsa-sha2-256, RFC 8332).
     /// Used by modern OpenSSH (8.8+) which disables ssh-rsa (SHA-1).
     pub fn encode_sha256(

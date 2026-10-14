@@ -93,6 +93,7 @@ signature = "2.2"
 
 # PEM parsing
 pem = "3.0"
+x509-cert = "=0.2.5"
 
 [dev-dependencies]
 # Testing utilities

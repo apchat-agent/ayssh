@@ -64,6 +64,7 @@ pub struct Transport {
     preferred_cipher: Option<String>,
     /// Preferred MAC algorithm (placed first in KEXINIT)
     preferred_mac: Option<String>,
+    enable_x509: bool,
     /// Whether kex-strict (CVE-2023-48795 / Terrapin mitigation) is active.
     /// When true, sequence numbers reset to 0 after NEWKEYS.
     kex_strict: bool,
@@ -131,6 +132,7 @@ impl Transport {
             preferred_kex: None,
             preferred_cipher: None,
             preferred_mac: None,
+            enable_x509: false,
             kex_strict: false,
             remote_host: None,
             remote_port: 22,
@@ -168,6 +170,12 @@ impl Transport {
     pub fn set_remote_host(&mut self, host: &str, port: u16) {
         self.remote_host = Some(host.to_string());
         self.remote_port = port;
+    }
+
+    /// Opt in to RFC 6187 x509v3-ssh-rsa host keys (disabled by default).
+    /// Trust is an end-entity certificate fingerprint pin, without CA validation.
+    pub fn set_x509_host_keys(&mut self, enabled: bool) {
+        self.enable_x509 = enabled;
     }
 
     /// Set the preferred KEX algorithm
@@ -302,7 +310,7 @@ impl Transport {
         &mut self,
         verifier: Option<&dyn crate::host_key_verify::HostKeyVerifier>,
     ) -> Result<(), crate::error::SshError> {
-        use crate::transport::handshake::{send_version, recv_version, parse_version_string, generate_client_kexinit_with_prefs, parse_server_kexinit, negotiate_algorithms};
+        use crate::transport::handshake::{send_version, recv_version, parse_version_string, generate_client_kexinit_with_x509, parse_server_kexinit};
         use crate::transport::kex::KexContext;
         use crate::protocol::KexAlgorithm;
         use std::str::FromStr;
@@ -318,10 +326,11 @@ impl Transport {
             .map_err(|e| crate::error::SshError::ProtocolError(e.to_string()))?;
         
         // 3. Generate client KEXINIT
-        let client_kexinit = generate_client_kexinit_with_prefs(
+        let client_kexinit = generate_client_kexinit_with_x509(
             self.preferred_kex.as_deref(),
             self.preferred_cipher.as_deref(),
             self.preferred_mac.as_deref(),
+            self.enable_x509,
         );
         debug!("Generated client KEXINIT ({} bytes)", client_kexinit.len());
         
@@ -416,7 +425,8 @@ impl Transport {
         }
 
         // 8. Negotiate algorithms
-        let negotiated = negotiate_algorithms(&client_proposal, &server_proposal);
+        let negotiated = client_proposal.select_common_algorithms(&server_proposal)
+            .map_err(|e| crate::error::SshError::ProtocolError(e.to_string()))?;
         debug!("Negotiated KEX algorithm: {}", negotiated.kex);
 
         // Store negotiated algorithms in handshake state
@@ -490,6 +500,9 @@ impl Transport {
         
         let reply_payload = &reply_bytes[payload_start..payload_end];
         
+        if reply_payload.is_empty() {
+            return Err(crate::error::SshError::ProtocolError("Empty KEX reply".into()));
+        }
         if reply_payload[0] != crate::protocol::MessageType::KexDhReply as u8 {
             return Err(crate::error::SshError::ProtocolError(
                 format!("Expected KEXDH_REPLY (31), got {}", reply_payload[0])
@@ -500,6 +513,12 @@ impl Transport {
         // Format: byte SSH_MSG_KEXDH_REPLY, string K_S (host key), mpint f, string signature
         let reply_data = &reply_payload[1..];
         
+        // Validate the complete certificate reply before any KEX processing.
+        if negotiated.host_key == crate::x509::ALGORITHM {
+            let (host_key, _) = crate::x509::parse_kex_reply(reply_data)?;
+            crate::x509::CertificateHostKey::parse(host_key)?;
+        }
+
         // Read server host key (string type = uint32 length + data)
         if reply_data.len() >= 4 {
             let host_key_len = u32::from_be_bytes([reply_data[0], reply_data[1], reply_data[2], reply_data[3]]) as usize;
@@ -509,7 +528,7 @@ impl Transport {
                 kex_context.set_server_host_key(server_host_key);
 
                 // Host key verification
-                if let Some(verifier) = verifier {
+                if let Some(verifier) = verifier.filter(|_| negotiated.host_key != crate::x509::ALGORITHM) {
                     // Extract key type from the blob (first string)
                     let key_type = if server_host_key.len() >= 4 {
                         let algo_len = u32::from_be_bytes([
@@ -573,6 +592,35 @@ impl Transport {
         // 11. Compute shared secret (and session ID)
         kex_context.compute_shared_secret()?;
         
+        if negotiated.host_key == crate::x509::ALGORITHM {
+            let (host_key, signature) = crate::x509::parse_kex_reply(reply_data)?;
+            let certificate = crate::x509::CertificateHostKey::parse(host_key)?;
+            let exchange_hash = kex_context.session_id.as_deref().ok_or_else(||
+                crate::error::SshError::ProtocolError("Missing exchange hash".into()))?;
+            certificate.verify_signature(exchange_hash, signature)?;
+            eprintln!("X509 host certificate subject: {}", certificate.subject);
+            eprintln!("X509 host certificate fingerprint: {}", certificate.fingerprint());
+            if let Some(verifier) = verifier {
+                let action = verifier.verify(
+                    self.remote_host.as_deref().unwrap_or("unknown"), self.remote_port,
+                    crate::x509::ALGORITHM, host_key,
+                ).await;
+                if !action.is_accepted() {
+                    return Err(crate::error::SshError::AuthenticationFailed(
+                        format!("X509 certificate fingerprint verification failed: {:?}", action)));
+                }
+            }
+        } else {
+            // A certificate blob is only legal when its algorithm was negotiated.
+            let mut key_data = reply_data;
+            let host_key = crate::x509::read_string(&mut key_data)?;
+            let mut key_data = host_key;
+            if crate::x509::read_string(&mut key_data)? == crate::x509::ALGORITHM.as_bytes() {
+                return Err(crate::error::SshError::ProtocolError(
+                    "Unnegotiated X509 host key".into()));
+            }
+        }
+
         // 12. Derive session keys
         let session_id = kex_context.session_id.clone()
             .expect("Session ID not computed");

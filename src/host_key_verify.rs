@@ -151,11 +151,15 @@ impl Default for TofuStore {
 #[async_trait::async_trait]
 impl HostKeyVerifier for TofuStore {
     async fn verify(&self, host: &str, port: u16, key_type: &str, key_blob: &[u8]) -> HostKeyAction {
+        let key_blob = match crate::x509::trust_identity(key_type, key_blob) {
+            Ok(identity) => identity,
+            Err(_) => return HostKeyAction::Reject,
+        };
         let key = Self::host_key(host, port);
         let mut keys = self.keys.lock().unwrap();
 
         if let Some((stored_type, stored_blob)) = keys.get(&key) {
-            if stored_type == key_type && stored_blob == key_blob {
+            if stored_type == key_type && stored_blob == &key_blob {
                 HostKeyAction::Accept
             } else {
                 HostKeyAction::Reject // KEY CHANGED
@@ -221,6 +225,10 @@ impl TofuFileStore {
 #[async_trait::async_trait]
 impl HostKeyVerifier for TofuFileStore {
     async fn verify(&self, host: &str, port: u16, key_type: &str, key_blob: &[u8]) -> HostKeyAction {
+        let key_blob = match crate::x509::trust_identity(key_type, key_blob) {
+            Ok(identity) => identity,
+            Err(_) => return HostKeyAction::Reject,
+        };
         let lookup_host = if port == 22 {
             host.to_string()
         } else {
@@ -296,6 +304,10 @@ impl StrictFileStore {
 #[async_trait::async_trait]
 impl HostKeyVerifier for StrictFileStore {
     async fn verify(&self, host: &str, port: u16, key_type: &str, key_blob: &[u8]) -> HostKeyAction {
+        let key_blob = match crate::x509::trust_identity(key_type, key_blob) {
+            Ok(identity) => identity,
+            Err(_) => return HostKeyAction::Reject,
+        };
         let lookup_host = if port == 22 {
             host.to_string()
         } else {
