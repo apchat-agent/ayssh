@@ -7,7 +7,7 @@
 use crate::error::SshError;
 use crate::protocol::KexAlgorithm;
 use crate::transport::handshake::{
-    generate_client_kexinit_with_prefs, negotiate_algorithms, parse_server_kexinit,
+    generate_server_kexinit_with_prefs, negotiate_algorithms, parse_server_kexinit,
     recv_version, send_version_custom, SSH_SERVER_VERSION_STRING,
 };
 use crate::transport::kex::KexContext;
@@ -160,7 +160,7 @@ pub async fn server_handshake_with_auth(
     debug!("Client version: {}", client_version);
 
     // Step 2: Send server KEXINIT
-    let server_kexinit = generate_client_kexinit_with_prefs(
+    let server_kexinit = generate_server_kexinit_with_prefs(
         filter.kex.as_deref(),
         filter.cipher.as_deref(),
         filter.mac.as_deref(),
@@ -186,6 +186,11 @@ pub async fn server_handshake_with_auth(
         .map_err(|e| SshError::ProtocolError(e.to_string()))?;
     let client_proposal = parse_server_kexinit(client_kexinit_payload)
         .map_err(|e| SshError::ProtocolError(e.to_string()))?;
+    let strict_kex = client_proposal.kex_algorithms.iter().any(|a| a == "kex-strict-c-v00@openssh.com")
+        && server_proposal.kex_algorithms.iter().any(|a| a == "kex-strict-s-v00@openssh.com");
+    if strict_kex && (recv_seq != 1 || client_kexinit_payload.first() != Some(&20)) {
+        return Err(SshError::ProtocolError("Strict KEX requires KEXINIT as the first packet".into()));
+    }
     // For negotiation, the CLIENT's proposal takes priority (first match wins)
     let negotiated = match negotiate_algorithms(&client_proposal, &server_proposal) {
         Ok(algorithms) => algorithms,
@@ -340,6 +345,11 @@ pub async fn server_handshake_with_auth(
         Some(&negotiated.enc_c2s),
         Some(&negotiated.mac_c2s),
     )?;
+
+    if strict_kex {
+        send_seq = 0;
+        recv_seq = 0;
+    }
 
     // Set up encryption: server encrypts with S2C keys, decrypts with C2S keys
     io.encrypt_state = Some(EncryptionState {

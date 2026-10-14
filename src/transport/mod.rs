@@ -420,7 +420,8 @@ impl Transport {
             .map_err(|e| crate::error::SshError::ProtocolError(format!("{} - Client KEXINIT: {:?}", e, &client_kexinit[..std::cmp::min(100, client_kexinit.len())])))?;
         
         // 7. Check for kex-strict (CVE-2023-48795 Terrapin mitigation)
-        if server_proposal.kex_algorithms.iter().any(|a| a == "kex-strict-s-v00@openssh.com") {
+        if server_proposal.kex_algorithms.iter().any(|a| a == "kex-strict-s-v00@openssh.com")
+            && client_proposal.kex_algorithms.iter().any(|a| a == "kex-strict-c-v00@openssh.com") {
             debug!("Server supports kex-strict — enabling sequence number reset after NEWKEYS");
             self.kex_strict = true;
         }

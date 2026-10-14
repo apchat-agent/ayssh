@@ -103,6 +103,17 @@ fn rsa_signature_hash_and_label() {
     }
 }
 
+#[tokio::test]
+async fn server_advertises_kex_strict() {
+    let (mut io, task) = start(HostKeyPair::generate_ed25519()).await;
+    let packet = io.read_unencrypted_packet(3).await.unwrap();
+    let end = packet.len() - packet[4] as usize;
+    let proposal = ayssh::transport::handshake::parse_server_kexinit(&packet[5..end]).unwrap();
+    assert!(proposal.kex_algorithms.iter().any(|a| a == "kex-strict-s-v00@openssh.com"));
+    assert!(!proposal.kex_algorithms.iter().any(|a| a == "kex-strict-c-v00@openssh.com"));
+    task.abort();
+}
+
 fn assert_kex_disconnect(packet: &[u8]) {
     assert_eq!(packet[5], 1, "expected SSH_MSG_DISCONNECT before any KEX reply or NEWKEYS");
     assert_eq!(u32::from_be_bytes(packet[6..10].try_into().unwrap()), 3);

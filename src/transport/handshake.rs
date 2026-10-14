@@ -323,6 +323,16 @@ pub fn parse_server_kexinit(data: &[u8]) -> Result<protocol::AlgorithmProposal, 
     })
 }
 
+/// Generate a server proposal with the OpenSSH strict KEX server marker.
+pub fn generate_server_kexinit_with_prefs(kex: Option<&str>, cipher: Option<&str>, mac: Option<&str>) -> Vec<u8> {
+    let mut payload = generate_client_kexinit_with_prefs(kex, cipher, mac);
+    let marker = b"kex-strict-c-v00@openssh.com";
+    if let Some(offset) = payload.windows(marker.len()).position(|w| w == marker) {
+        payload[offset + 11] = b's';
+    }
+    payload
+}
+
 /// Select the first matching algorithm from a list
 pub fn select_algorithm(preferred: &[String], server_list: &[String]) -> Option<String> {
     for algo in preferred {
