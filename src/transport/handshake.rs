@@ -334,37 +334,9 @@ pub fn select_algorithm(preferred: &[String], server_list: &[String]) -> Option<
 }
 
 /// Negotiate algorithms from client and server proposals
-pub fn negotiate_algorithms(client: &protocol::AlgorithmProposal, server: &protocol::AlgorithmProposal) -> protocol::NegotiatedAlgorithms {
-    let kex = select_algorithm(&client.kex_algorithms, &server.kex_algorithms)
-        .expect("No common KEX algorithm");
-    
-    let host_key = select_algorithm(&client.server_host_key_algorithms, &server.server_host_key_algorithms)
-        .expect("No common host key algorithm");
-    
-    let enc_c2s = select_algorithm(&client.encryption_algorithms_c2s, &server.encryption_algorithms_c2s)
-        .expect("No common encryption algorithm (C2S)");
-    
-    let enc_s2c = select_algorithm(&client.encryption_algorithms_s2c, &server.encryption_algorithms_s2c)
-        .expect("No common encryption algorithm (S2C)");
-    
-    let mac_c2s = select_algorithm(&client.mac_algorithms_c2s, &server.mac_algorithms_c2s)
-        .expect("No common MAC algorithm (C2S)");
-    
-    let mac_s2c = select_algorithm(&client.mac_algorithms_s2c, &server.mac_algorithms_s2c)
-        .expect("No common MAC algorithm (S2C)");
-    
-    let comp = select_algorithm(&client.compression_algorithms, &server.compression_algorithms)
-        .expect("No common compression algorithm");
-    
-    protocol::NegotiatedAlgorithms {
-        kex,
-        host_key,
-        enc_c2s,
-        enc_s2c,
-        mac_c2s,
-        mac_s2c,
-        compression: comp,
-    }
+pub fn negotiate_algorithms(client: &protocol::AlgorithmProposal, server: &protocol::AlgorithmProposal) -> Result<protocol::NegotiatedAlgorithms, crate::error::SshError> {
+    client.select_common_algorithms(server)
+        .map_err(|e| crate::error::SshError::ProtocolError(e.to_string()))
 }
 
 /// RFC 4253 section 11.1: terminate unsuccessful algorithm negotiation.
@@ -377,27 +349,6 @@ pub(crate) async fn disconnect_kex_failed<T: AsyncWriteExt + Unpin>(stream: &mut
     payload.put_slice(description);
     payload.put_u32(0); // language tag
     let _ = stream.write_all(&crate::server::encrypted_io::build_unencrypted_packet(&payload)).await;
-}
-
-/// RFC 4253 section 7: guesses include both KEX and host key algorithms.
-pub(crate) fn wrong_kex_guess(proposal: &protocol::AlgorithmProposal, selected: &protocol::NegotiatedAlgorithms) -> bool {
-    proposal.first_kex_packet_follows &&
-        (proposal.kex_algorithms.first() != Some(&selected.kex) ||
-         proposal.server_host_key_algorithms.first() != Some(&selected.host_key))
-}
-
-pub(crate) async fn read_plaintext_payload<T: AsyncReadExt + Unpin>(stream: &mut T) -> Result<Vec<u8>, crate::error::SshError> {
-    let mut header = [0u8; 4];
-    stream.read_exact(&mut header).await?;
-    let length = u32::from_be_bytes(header) as usize;
-    crate::transport::validate_plaintext_header(length, None)?;
-    let mut pad = [0u8; 1];
-    stream.read_exact(&mut pad).await?;
-    crate::transport::validate_plaintext_header(length, Some(pad[0]))?;
-    let mut body = vec![0u8; length - 1];
-    stream.read_exact(&mut body).await?;
-    body.truncate(length - 1 - pad[0] as usize);
-    Ok(body)
 }
 
 /// Send SSH version string
@@ -510,7 +461,10 @@ pub async fn perform_handshake<T: AsyncReadExt + AsyncWriteExt + Unpin>(
     // 5. Negotiate algorithms
     let client_proposal = parse_server_kexinit(&client_kexinit)
         .map_err(|e| crate::error::SshError::ProtocolError(e.to_string()))?;
-    let negotiated = negotiate_algorithms(&client_proposal, &server_proposal);
+    let negotiated = match negotiate_algorithms(&client_proposal, &server_proposal) {
+        Ok(algorithms) => algorithms,
+        Err(error) => { disconnect_kex_failed(&mut stream).await; return Err(error); }
+    };
     
     // 6. Create transport session and initiate KEX
     let mut transport_session = TransportSession::new(stream, KexAlgorithm::from_str(&negotiated.kex).unwrap_or(KexAlgorithm::Curve25519Sha256));
@@ -579,6 +533,33 @@ pub async fn perform_handshake<T: AsyncReadExt + AsyncWriteExt + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kex_markers_not_selectable() {
+        let mut client = parse_server_kexinit(&generate_client_kexinit()).unwrap();
+        for marker in ["ext-info-c", "ext-info-s", "kex-strict-c-v00@openssh.com", "kex-strict-s-v00@openssh.com"] {
+            client.kex_algorithms = vec![marker.to_string()];
+            assert!(negotiate_algorithms(&client, &client).is_err());
+        }
+    }
+
+    #[test]
+    fn no_common_algorithm_errors() {
+        for category in 0..7 {
+            let mut client = parse_server_kexinit(&generate_client_kexinit()).unwrap();
+            let server = client.clone();
+            match category {
+                0 => client.kex_algorithms.clear(),
+                1 => client.server_host_key_algorithms.clear(),
+                2 => client.encryption_algorithms_c2s.clear(),
+                3 => client.encryption_algorithms_s2c.clear(),
+                4 => client.mac_algorithms_c2s.clear(),
+                5 => client.mac_algorithms_s2c.clear(),
+                _ => client.compression_algorithms.clear(),
+            }
+            assert!(negotiate_algorithms(&client, &server).is_err());
+        }
+    }
 
     #[test]
     fn test_parse_version_string_valid() {
@@ -686,7 +667,7 @@ mod tests {
         let client = parse_server_kexinit(&generate_client_kexinit()).unwrap();
         let server = parse_server_kexinit(&generate_client_kexinit()).unwrap();
 
-        let negotiated = negotiate_algorithms(&client, &server);
+        let negotiated = negotiate_algorithms(&client, &server).unwrap();
 
         // According to RFC 4253 Section 7.1: "The first algorithm in each list
         // that is also in the other's list is chosen."
@@ -827,10 +808,10 @@ mod tests {
         let server = parse_server_kexinit(&generate_client_kexinit()).unwrap();
         // Reverse client KEX order
         client.kex_algorithms.reverse();
-        let negotiated = negotiate_algorithms(&client, &server);
+        let negotiated = negotiate_algorithms(&client, &server).unwrap();
         // Should pick client's first that's also in server
         assert!(server.kex_algorithms.contains(&negotiated.kex));
-        assert_eq!(negotiated.kex, client.kex_algorithms[0]);
+        assert_eq!(negotiated.kex, "ecdh-sha2-nistp521");
     }
 
     // --- HandshakeState ---

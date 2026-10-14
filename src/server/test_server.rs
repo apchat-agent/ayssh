@@ -187,7 +187,13 @@ pub async fn server_handshake_with_auth(
     let client_proposal = parse_server_kexinit(client_kexinit_payload)
         .map_err(|e| SshError::ProtocolError(e.to_string()))?;
     // For negotiation, the CLIENT's proposal takes priority (first match wins)
-    let negotiated = negotiate_algorithms(&client_proposal, &server_proposal);
+    let negotiated = match negotiate_algorithms(&client_proposal, &server_proposal) {
+        Ok(algorithms) => algorithms,
+        Err(error) => {
+            crate::transport::handshake::disconnect_kex_failed(&mut io.stream).await;
+            return Err(error);
+        }
+    };
     info!("Negotiated: kex={}, enc={}, mac={}", negotiated.kex, negotiated.enc_c2s, negotiated.mac_c2s);
 
     // Step 5: Key exchange (receive KEXDH_INIT, send KEXDH_REPLY)
