@@ -489,15 +489,20 @@ pub async fn perform_handshake<T: AsyncReadExt + AsyncWriteExt + Unpin>(
     
     // 3. Generate and send client KEXINIT
     let client_kexinit = generate_client_kexinit();
-    stream.write_all(&client_kexinit).await?;
+    stream.write_all(&crate::server::encrypted_io::build_unencrypted_packet(&client_kexinit)).await?;
     
     // 4. Receive and parse server KEXINIT
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf).await?;
     let len = u32::from_be_bytes(len_buf) as usize;
     
-    let mut server_kexinit_bytes = vec![0u8; len];
-    stream.read_exact(&mut server_kexinit_bytes).await?;
+    crate::transport::validate_plaintext_header(len, None)?;
+    let mut pad = [0u8; 1];
+    stream.read_exact(&mut pad).await?;
+    crate::transport::validate_plaintext_header(len, Some(pad[0]))?;
+    let mut body = vec![0u8; len - 1];
+    stream.read_exact(&mut body).await?;
+    let server_kexinit_bytes = &body[..len - 1 - pad[0] as usize];
     
     let server_proposal = parse_server_kexinit(&server_kexinit_bytes)
         .map_err(|e| crate::error::SshError::ProtocolError(e.to_string()))?;
