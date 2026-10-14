@@ -197,3 +197,83 @@ async fn tofu_and_strict_stores_pin_leaf_fingerprint() {
         .await
         .is_accepted());
 }
+
+#[tokio::test]
+async fn transport_rejects_bad_exchange_signature_before_saving_tofu_pin() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+    async fn read_packet(stream: &mut TcpStream) {
+        let length = stream.read_u32().await.unwrap() as usize;
+        assert!(length < 1024 * 1024);
+        let mut data = vec![0; length];
+        stream.read_exact(&mut data).await.unwrap();
+    }
+    async fn send_packet(stream: &mut TcpStream, payload: &[u8]) {
+        let padding = 8 - ((5 + payload.len()) % 8);
+        let padding = if padding < 4 { padding + 8 } else { padding };
+        let mut packet = Vec::new();
+        packet.extend_from_slice(&((1 + payload.len() + padding) as u32).to_be_bytes());
+        packet.push(padding as u8);
+        packet.extend_from_slice(payload);
+        packet.resize(packet.len() + padding, 0);
+        stream.write_all(&packet).await.unwrap();
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut byte = [0];
+        loop {
+            stream.read_exact(&mut byte).await.unwrap();
+            if byte[0] == b'\n' {
+                break;
+            }
+        }
+        stream.write_all(b"SSH-2.0-x509-test\r\n").await.unwrap();
+        read_packet(&mut stream).await;
+        let proposal = generate_client_kexinit_with_x509(None, None, None, true);
+        send_packet(&mut stream, &proposal).await;
+        read_packet(&mut stream).await;
+        let mut reply = vec![31];
+        string(&mut reply, &blob(&[CERT], &[]));
+        string(&mut reply, &[2]); // Valid group1 DH public value.
+                                  // This valid SHA-1 signature signs MESSAGE, not this connection's exchange hash.
+        string(
+            &mut reply,
+            &SshSignature::new("ssh-rsa", SIGNATURE).encode(),
+        );
+        send_packet(&mut stream, &reply).await;
+        assert_eq!(
+            stream.read(&mut byte).await.unwrap(),
+            0,
+            "client must disconnect before NEWKEYS/authentication"
+        );
+    });
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("known_hosts");
+    let pins = TofuFileStore::new(&path).unwrap();
+    let mut transport = ayssh::SshClient::new(addr.ip().to_string(), addr.port())
+        .with_x509_host_keys(true)
+        .connect()
+        .await
+        .unwrap();
+    let error = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        transport.handshake_with_verifier(&pins),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("RSA signature verification failed"),
+        "{error}"
+    );
+    assert!(
+        !path.exists(),
+        "invalid signatures must never create TOFU pins"
+    );
+    drop(transport);
+    server.await.unwrap();
+}
