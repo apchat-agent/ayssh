@@ -46,6 +46,8 @@ pub struct RawSshSession {
     window_consumed: u32,
     /// Banner messages received during authentication (RFC 4252 §5.4)
     banners: Vec<String>,
+    /// Whether this side has already sent CHANNEL_CLOSE (RFC 4254 section 5.3).
+    close_sent: bool,
 }
 
 impl RawSshSession {
@@ -109,7 +111,7 @@ impl RawSshSession {
     /// `channel_id` must be the REMOTE channel ID (the one used when sending
     /// messages to the server, from CHANNEL_OPEN_CONFIRMATION).
     pub fn from_parts(transport: Transport, channel_id: u32) -> Self {
-        Self { transport, channel_id, window_consumed: 0, banners: Vec::new() }
+        Self { transport, channel_id, window_consumed: 0, banners: Vec::new(), close_sent: false }
     }
 
     /// Send raw bytes to the remote shell.
@@ -127,7 +129,7 @@ impl RawSshSession {
     ///   - CHANNEL_DATA (94): extract and return the payload
     ///   - CHANNEL_WINDOW_ADJUST (93): handled internally, keep reading
     ///   - CHANNEL_EOF (96): return error (channel ended)
-    ///   - CHANNEL_CLOSE (97): return error (channel closed)
+    ///   - CHANNEL_CLOSE (97): acknowledge once, then return error (channel closed)
     ///   - Other messages: ignored, keep reading
     pub async fn receive(&mut self, timeout: Duration) -> Result<Vec<u8>, SshError> {
         let deadline = tokio::time::Instant::now() + timeout;
@@ -165,7 +167,13 @@ impl RawSshSession {
                         }
                         93 => continue, // CHANNEL_WINDOW_ADJUST — ignore
                         96 => return Err(SshError::ChannelError("Channel EOF".into())),
-                        97 => return Err(SshError::ChannelError("Channel closed".into())),
+                        97 => {
+                            // RFC 4254 section 5.3: reply unless we already sent
+                            // CLOSE. Use the peer's channel ID, not the incoming
+                            // recipient (which identifies our local channel).
+                            self.disconnect().await?;
+                            return Err(SshError::ChannelError("Channel closed".into()));
+                        }
                         _ => continue, // other messages (e.g., global requests)
                     }
                 }
@@ -178,7 +186,11 @@ impl RawSshSession {
 
     /// Close the channel and disconnect.
     pub async fn disconnect(&mut self) -> Result<(), SshError> {
-        self.transport.send_channel_close(self.channel_id).await
+        if !self.close_sent {
+            self.transport.send_channel_close(self.channel_id).await?;
+            self.close_sent = true;
+        }
+        Ok(())
     }
 
     /// Get banner messages received during authentication (RFC 4252 §5.4).
@@ -322,7 +334,7 @@ impl RawSshSession {
         let _shell_response = transport.recv_message().await?;
         debug!("Shell started");
 
-        Ok(Self { transport, channel_id, window_consumed: 0, banners: Vec::new() })
+        Ok(Self { transport, channel_id, window_consumed: 0, banners: Vec::new(), close_sent: false })
     }
 
     /// Open a new connection, authenticate, and execute a command (exec channel).
