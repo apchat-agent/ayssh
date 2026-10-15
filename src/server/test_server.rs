@@ -116,7 +116,8 @@ impl TestSshServer {
 /// Auth behavior for the test server
 #[derive(Debug, Clone)]
 pub enum AuthBehavior {
-    /// Accept recognized auth methods without checking credentials (test fixture only).
+    /// Permit credential-free access via none/password/keyboard-interactive.
+    /// Public keys are rejected because this fixture has no authorized keys.
     AcceptAll,
     /// Reject auth with USERAUTH_FAILURE
     RejectPassword { available_methods: String },
@@ -134,7 +135,16 @@ pub enum AuthBehavior {
 /// Read authentication requests until the client selects a recognized method.
 /// RFC 4252 section 5 requires unknown methods to be rejected, even by a
 /// credential-free test server. A rejection leaves authentication in progress.
-async fn recv_auth_request(io: &mut ServerEncryptedIO) -> Result<Vec<u8>, SshError> {
+async fn recv_auth_request(io: &mut ServerEncryptedIO, behavior: &AuthBehavior) -> Result<Vec<u8>, SshError> {
+    // The default fixture does not configure or authorize any public keys.
+    // In particular, an unsigned query must never produce USERAUTH_SUCCESS
+    // (RFC 4252 section 7). Dedicated scripted modes retain their test policy.
+    let allow_publickey = !matches!(behavior, AuthBehavior::AcceptAll);
+    let available_methods: &[u8] = if allow_publickey {
+        b"password,publickey,keyboard-interactive"
+    } else {
+        b"password,keyboard-interactive"
+    };
     loop {
         let request = io.recv_message().await?;
         if request.first() != Some(&50) {
@@ -147,10 +157,12 @@ async fn recv_auth_request(io: &mut ServerEncryptedIO) -> Result<Vec<u8>, SshErr
         let _user = crate::protocol::SshString::decode(&mut fields).map_err(decode_error)?;
         let _service = crate::protocol::SshString::decode(&mut fields).map_err(decode_error)?;
         let method = crate::protocol::SshString::decode(&mut fields).map_err(decode_error)?;
-        if matches!(method.as_bytes(), b"none" | b"password" | b"publickey" | b"keyboard-interactive") {
+        if matches!(method.as_bytes(), b"none" | b"password" | b"keyboard-interactive")
+            || (method.as_bytes() == b"publickey" && allow_publickey)
+        {
             return Ok(request);
         }
-        send_auth_failure(io, b"password,publickey,keyboard-interactive").await?;
+        send_auth_failure(io, available_methods).await?;
     }
 }
 
@@ -431,7 +443,7 @@ pub async fn server_handshake_with_auth(
     debug!("Sent SERVICE_ACCEPT");
 
     // Step 8: Handle USERAUTH_REQUEST
-    let auth_req = recv_auth_request(&mut io).await?;
+    let auth_req = recv_auth_request(&mut io, auth_behavior).await?;
     debug!("Received USERAUTH_REQUEST");
 
     match auth_behavior {
@@ -520,7 +532,7 @@ pub async fn server_handshake_with_auth(
             debug!("Sent USERAUTH_FAILURE (reject first attempt), available: {}", available_methods);
 
             // Wait for second auth attempt
-            let _auth_req2 = recv_auth_request(&mut io).await?;
+            let _auth_req2 = recv_auth_request(&mut io, auth_behavior).await?;
             debug!("Received second USERAUTH_REQUEST, accepting");
 
             // Accept second attempt
@@ -562,7 +574,7 @@ pub async fn server_handshake_with_auth(
             debug!("Sent SSH_MSG_USERAUTH_PK_OK for algorithm {:?}", std::str::from_utf8(&algo).unwrap_or("?"));
 
             // Receive second USERAUTH_REQUEST with signature
-            let _auth_req2 = recv_auth_request(&mut io).await?;
+            let _auth_req2 = recv_auth_request(&mut io, auth_behavior).await?;
 
             // Accept unconditionally (don't verify signature)
             io.send_message(&[52]).await?; // USERAUTH_SUCCESS
