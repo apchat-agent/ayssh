@@ -311,7 +311,7 @@ impl Transport {
         &mut self,
         verifier: Option<&dyn crate::host_key_verify::HostKeyVerifier>,
     ) -> Result<(), crate::error::SshError> {
-        use crate::transport::handshake::{send_version, recv_version, parse_version_string, generate_client_kexinit_with_x509, parse_server_kexinit};
+        use crate::transport::handshake::{send_version, recv_server_version, parse_version_string, generate_client_kexinit_with_x509, parse_server_kexinit};
         use crate::transport::kex::KexContext;
         use crate::protocol::KexAlgorithm;
         use std::str::FromStr;
@@ -320,7 +320,7 @@ impl Transport {
         send_version(self.stream_mut()).await?;
         
         // 2. Receive server version
-        let server_ver = recv_version(self.stream_mut()).await?;
+        let server_ver = recv_server_version(self.stream_mut()).await?;
         debug!("Server version: {}", server_ver);
         
         let (_proto, _software) = parse_version_string(server_ver.as_bytes())
