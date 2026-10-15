@@ -70,3 +70,23 @@ async fn unknown_auth_method_is_rejected_and_can_retry() {
     transport.send_message(request(b"none").as_bytes()).await.unwrap();
     assert_eq!(reply(&mut transport).await, [52]);
 }
+
+#[tokio::test]
+async fn unsigned_publickey_query_is_rejected_and_can_retry() {
+    let (mut transport, _server) = connect().await;
+    let key = ayssh::server::HostKeyPair::generate_ed25519().public_key_blob();
+    for algorithm in [b"ssh-ed25519".as_slice(), b"unknown-key-algorithm"] {
+        let mut query = request(b"publickey");
+        query.write_bool(false);
+        query.write_string(algorithm);
+        query.write_string(&key);
+        transport.send_message(query.as_bytes()).await.unwrap();
+        let response = reply(&mut transport).await;
+        assert_failure(&response);
+        let methods = std::str::from_utf8(&response[5..response.len() - 1]).unwrap();
+        assert!(!methods.split(',').any(|method| method == "publickey"));
+    }
+    // A query never authenticates the client; it may still try another method.
+    transport.send_message(request(b"none").as_bytes()).await.unwrap();
+    assert_eq!(reply(&mut transport).await, [52]);
+}
