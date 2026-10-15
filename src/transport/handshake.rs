@@ -408,6 +408,29 @@ pub async fn send_version_custom<T: AsyncWriteExt + Unpin>(stream: &mut T, versi
 /// Server version string
 pub const SSH_SERVER_VERSION_STRING: &str = "SSH-2.0-ayssh_test_server\r\n";
 
+/// Receive a server identification, discarding preceding informational lines.
+/// RFC 4253 section 4.2 permits these lines only before the SSH identification.
+/// Discard banners as a stream so their length does not affect the version
+/// limit or require buffering, and leave the following binary packet untouched.
+pub async fn recv_server_version<T: AsyncReadExt + Unpin>(stream: &mut T) -> Result<String, crate::error::SshError> {
+    loop {
+        let mut prefix = Vec::with_capacity(4);
+        while prefix.len() < 4 {
+            let byte = stream.read_u8().await?;
+            prefix.push(byte);
+            if byte == b'\n' {
+                break;
+            }
+        }
+        if prefix == b"SSH-" {
+            return recv_version(&mut AsyncReadExt::chain(prefix.as_slice(), stream)).await;
+        }
+        if prefix.last() != Some(&b'\n') {
+            while stream.read_u8().await? != b'\n' {}
+        }
+    }
+}
+
 /// Receive SSH version string
 pub async fn recv_version<T: AsyncReadExt + Unpin>(stream: &mut T) -> Result<String, crate::error::SshError> {
     // Read version string byte-by-byte to avoid BufReader consuming
@@ -473,7 +496,7 @@ pub async fn perform_handshake<T: AsyncReadExt + AsyncWriteExt + Unpin>(
     send_version(&mut stream).await?;
     
     // 2. Receive server version
-    let server_ver = recv_version(&mut stream).await?;
+    let server_ver = recv_server_version(&mut stream).await?;
     let (_proto, _software) = parse_version_string(server_ver.as_bytes())
         .map_err(|e| crate::error::SshError::ProtocolError(e.to_string()))?;
     
@@ -890,6 +913,27 @@ mod tests {
         let mut cursor = std::io::Cursor::new(data.to_vec());
         let version = recv_version(&mut cursor).await.unwrap();
         assert_eq!(version, "SSH-2.0-TestServer");
+    }
+
+    #[tokio::test]
+    async fn test_server_banner_preserves_packet_boundary() {
+        let mut data = b"\r\nNotice\r\nSSH-2.0-TestServer\r\n".to_vec();
+        data.extend_from_slice(&[0, 0, 0, 12, 10, 21]);
+        let mut cursor = std::io::Cursor::new(data);
+        assert_eq!(recv_server_version(&mut cursor).await.unwrap(), "SSH-2.0-TestServer");
+        let mut rest = Vec::new();
+        cursor.read_to_end(&mut rest).await.unwrap();
+        assert_eq!(rest, [0, 0, 0, 12, 10, 21]);
+    }
+
+    #[tokio::test]
+    async fn test_server_banner_does_not_relax_identification_limit() {
+        let mut data = b"Notice\r\nSSH-2.0-".to_vec();
+        data.extend_from_slice(&[b'a'; 300]);
+        data.extend_from_slice(b"\r\n");
+        let mut cursor = std::io::Cursor::new(data);
+        assert!(recv_server_version(&mut cursor).await.unwrap_err().to_string()
+            .contains("Version string too long"));
     }
 
     #[tokio::test]

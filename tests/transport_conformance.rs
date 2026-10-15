@@ -27,6 +27,27 @@ async fn start(key: HostKeyPair) -> (ServerEncryptedIO, tokio::task::JoinHandle<
 }
 
 #[tokio::test]
+async fn client_processes_server_pre_version_lines() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let stream = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+    let (server, _) = listener.accept().await.unwrap();
+    let task = tokio::spawn(async move {
+        let mut transport = ayssh::transport::Transport::new(stream);
+        let _ = transport.handshake().await;
+    });
+    let mut io = ServerEncryptedIO::new(server);
+    // Banner lines may be longer than the identification's 255-byte limit.
+    let mut introduction = b"Welcome to the test server\r\n".to_vec();
+    introduction.extend_from_slice(&[b'x'; 512]);
+    introduction.extend_from_slice(b"\r\nSSH-2.0-regression\r\n");
+    io.stream.write_all(&introduction).await.unwrap();
+    recv_version(&mut io.stream).await.unwrap();
+    let packet = io.read_unencrypted_packet(3).await;
+    task.abort();
+    assert_eq!(packet.expect("client must continue to KEXINIT after banner lines")[5], 20);
+}
+
+#[tokio::test]
 async fn wrong_kex_guess_discarded() {
     for wrong_host in [false, true] {
     let (mut io, task) = start(HostKeyPair::generate_ed25519()).await;
