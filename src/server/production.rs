@@ -198,38 +198,16 @@ async fn authenticate<H: ServerHandler + ?Sized>(
             io.send_message(&failure).await?;
             continue;
         }
-        let mut key_fields = Fields(blob);
-        if key_fields.string()? != algorithm {
-            return Err(protocol("Public key algorithm mismatch"));
-        }
-        let key_bytes: &[u8; 32] = key_fields
-            .string()?
-            .try_into()
-            .map_err(|_| protocol("Invalid Ed25519 key length"))?;
-        key_fields.end()?;
-        let key = ed25519_dalek::VerifyingKey::from_bytes(key_bytes)
-            .map_err(|_| protocol("Invalid Ed25519 public key"))?;
         if let Some(signature) = signature {
-            let mut signature_fields = Fields(signature);
-            if signature_fields.string()? != algorithm {
-                return Err(protocol("Signature algorithm mismatch"));
-            }
-            let signature = ed25519_dalek::Signature::from_slice(signature_fields.string()?)
-                .map_err(|_| protocol("Invalid Ed25519 signature length"))?;
-            signature_fields.end()?;
-            let mut signed_data = Vec::new();
-            string(&mut signed_data, session_id);
-            signed_data.extend_from_slice(&request[..signed_prefix]);
-            // RFC 4252 section 7 binds username, service, key and signature to
-            // this transport's original session ID. Strict verification also
-            // rejects weak/noncanonical Ed25519 signatures.
-            if key.verify_strict(&signed_data, &signature).is_ok()
+            if verify_signature(session_id, &request[..signed_prefix], blob, signature)
                 && handler.authorize_public_key(username, blob).await
             {
                 io.send_message(&[52]).await?;
                 return Ok(username.to_owned());
             }
-        } else if handler.authorize_public_key(username, blob).await {
+        } else if decode_public_key(blob).is_ok()
+            && handler.authorize_public_key(username, blob).await
+        {
             let mut challenge = vec![60];
             string(&mut challenge, algorithm);
             string(&mut challenge, blob);
@@ -241,6 +219,47 @@ async fn authenticate<H: ServerHandler + ?Sized>(
     Err(SshError::AuthenticationFailed(
         "Authentication attempt limit reached".into(),
     ))
+}
+
+fn decode_public_key(blob: &[u8]) -> Result<ed25519_dalek::VerifyingKey, SshError> {
+    let mut fields = Fields(blob);
+    if fields.string()? != b"ssh-ed25519" {
+        return Err(protocol("Unsupported public key algorithm"));
+    }
+    let bytes: &[u8; 32] = fields
+        .string()?
+        .try_into()
+        .map_err(|_| protocol("Invalid Ed25519 key length"))?;
+    fields.end()?;
+    ed25519_dalek::VerifyingKey::from_bytes(bytes)
+        .map_err(|_| protocol("Invalid Ed25519 public key"))
+}
+
+/// Verify the RFC 4252 section 7 signature over the original transport session
+/// identifier and complete USERAUTH_REQUEST prefix. Strict verification rejects
+/// weak/noncanonical Ed25519 signatures. Malformed wire blobs fail closed.
+fn verify_signature(
+    session_id: &[u8],
+    request_prefix: &[u8],
+    public_key_blob: &[u8],
+    signature_blob: &[u8],
+) -> bool {
+    let verify = || -> Result<(), SshError> {
+        let key = decode_public_key(public_key_blob)?;
+        let mut fields = Fields(signature_blob);
+        if fields.string()? != b"ssh-ed25519" {
+            return Err(protocol("Unsupported signature algorithm"));
+        }
+        let signature = ed25519_dalek::Signature::from_slice(fields.string()?)
+            .map_err(|_| protocol("Invalid Ed25519 signature length"))?;
+        fields.end()?;
+        let mut signed_data = Vec::new();
+        string(&mut signed_data, session_id);
+        signed_data.extend_from_slice(request_prefix);
+        key.verify_strict(&signed_data, &signature)
+            .map_err(|_| protocol("Invalid authentication signature"))
+    };
+    verify().is_ok()
 }
 
 struct Messages {
