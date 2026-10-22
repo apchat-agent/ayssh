@@ -561,3 +561,151 @@ async fn run_command(
     .await;
     Ok(())
 }
+#[cfg(test)]
+mod signature_tests {
+    use super::verify_signature;
+    use ed25519_dalek::{Signer, SigningKey};
+
+    fn wire_string(output: &mut Vec<u8>, value: &[u8]) {
+        output.extend_from_slice(&(value.len() as u32).to_be_bytes());
+        output.extend_from_slice(value);
+    }
+
+    fn public_blob(key: &SigningKey) -> Vec<u8> {
+        let mut blob = Vec::new();
+        wire_string(&mut blob, b"ssh-ed25519");
+        wire_string(&mut blob, &key.verifying_key().to_bytes());
+        blob
+    }
+
+    // RFC 4252 section 7: the signature covers the initial session identifier
+    // followed by USERAUTH_REQUEST through the complete public-key blob.
+    fn request(username: &[u8], key_blob: &[u8]) -> Vec<u8> {
+        let mut request = vec![50];
+        wire_string(&mut request, username);
+        wire_string(&mut request, b"ssh-connection");
+        wire_string(&mut request, b"publickey");
+        request.push(1);
+        wire_string(&mut request, b"ssh-ed25519");
+        wire_string(&mut request, key_blob);
+        request
+    }
+
+    fn sign(key: &SigningKey, session_id: &[u8], request: &[u8]) -> Vec<u8> {
+        let mut signed_data = Vec::new();
+        wire_string(&mut signed_data, session_id);
+        signed_data.extend_from_slice(request);
+        let mut signature = Vec::new();
+        wire_string(&mut signature, b"ssh-ed25519");
+        wire_string(&mut signature, &key.sign(&signed_data).to_bytes());
+        signature
+    }
+
+    #[test]
+    fn signed_authentication_request_is_verified() {
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let blob = public_blob(&key);
+        let request = request(b"alice", &blob);
+        let session = [11; 32];
+        let signature = sign(&key, &session, &request);
+        assert!(verify_signature(&session, &request, &blob, &signature));
+    }
+
+    #[test]
+    fn signed_authentication_rejects_a_changed_username() {
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let blob = public_blob(&key);
+        let original = request(b"alice", &blob);
+        let tampered = request(b"carol", &blob);
+        let session = [11; 32];
+        let signature = sign(&key, &session, &original);
+        assert!(!verify_signature(&session, &tampered, &blob, &signature));
+    }
+
+    #[test]
+    fn signed_authentication_rejects_replay_on_another_session() {
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let blob = public_blob(&key);
+        let request = request(b"alice", &blob);
+        let signature = sign(&key, &[11; 32], &request);
+        assert!(!verify_signature(&[12; 32], &request, &blob, &signature));
+    }
+
+    #[test]
+    fn attacker_cannot_sign_for_another_public_key() {
+        let registered = SigningKey::from_bytes(&[7; 32]);
+        let attacker = SigningKey::from_bytes(&[9; 32]);
+        let blob = public_blob(&registered);
+        let request = request(b"alice", &blob);
+        let session = [11; 32];
+        let forged = sign(&attacker, &session, &request);
+        assert!(!verify_signature(&session, &request, &blob, &forged));
+    }
+
+    #[test]
+    fn truncated_key_and_signature_blobs_are_rejected_without_panicking() {
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let blob = public_blob(&key);
+        let request = request(b"alice", &blob);
+        let session = [11; 32];
+        let signature = sign(&key, &session, &request);
+        for length in 0..blob.len() {
+            assert!(
+                !verify_signature(&session, &request, &blob[..length], &signature),
+                "accepted key truncated to {length} bytes"
+            );
+        }
+        for length in 0..signature.len() {
+            assert!(
+                !verify_signature(&session, &request, &blob, &signature[..length]),
+                "accepted signature truncated to {length} bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_key_and_signature_blobs_are_rejected_without_panicking() {
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let blob = public_blob(&key);
+        let request = request(b"alice", &blob);
+        let session = [11; 32];
+        let signature = sign(&key, &session, &request);
+
+        let mut wrong_key_algorithm = blob.clone();
+        wrong_key_algorithm[4] = b'x';
+        let mut trailing_key_bytes = blob.clone();
+        trailing_key_bytes.push(0);
+        let mut wrong_key_size = Vec::new();
+        wire_string(&mut wrong_key_size, b"ssh-ed25519");
+        wire_string(&mut wrong_key_size, &[7; 31]);
+        for malformed in [
+            vec![0xff; 4],
+            wrong_key_algorithm,
+            trailing_key_bytes,
+            wrong_key_size,
+        ] {
+            assert!(!verify_signature(
+                &session, &request, &malformed, &signature
+            ));
+        }
+
+        let mut wrong_signature_algorithm = signature.clone();
+        wrong_signature_algorithm[4] = b'x';
+        let mut trailing_signature_bytes = signature.clone();
+        trailing_signature_bytes.push(0);
+        let mut corrupted_signature = signature.clone();
+        *corrupted_signature.last_mut().unwrap() ^= 0x80;
+        let mut wrong_signature_size = Vec::new();
+        wire_string(&mut wrong_signature_size, b"ssh-ed25519");
+        wire_string(&mut wrong_signature_size, &[7; 63]);
+        for malformed in [
+            vec![0xff; 4],
+            wrong_signature_algorithm,
+            trailing_signature_bytes,
+            corrupted_signature,
+            wrong_signature_size,
+        ] {
+            assert!(!verify_signature(&session, &request, &blob, &malformed));
+        }
+    }
+}
