@@ -84,8 +84,19 @@ cargo test --test production_server
 They require `ssh`, `ssh-keygen`, `sh` and `cat`, isolate client configuration and
 known-host files, and include a three-MiB binary stream and denied request cases.
 
-Authentication regression tests additionally bind proof to the exact username and
-original transport session. Forged signatures, cross-session replay, truncated
-fields, oversized encoded lengths, algorithm mismatches and trailing fields fail
-closed. Review confirmed the same verifier is called by the production signed
-request branch; these tests do not exercise a separate test-only verifier.
+Run the production authentication regression tests with:
+
+```sh
+cargo test --test production_auth
+```
+
+[`tests/production_auth.rs`](tests/production_auth.rs) drives `serve_connection`
+over TCP using the client transport and hand-built signed authentication requests.
+It first confirms the key is registered, then requires `USERAUTH_FAILURE` for a
+random signature, a valid signature from another real transport session, and a
+valid signature over a different username. None may reach the exec handler. A
+matching signature authenticates and executes through the same harness. Replacing
+the production authentication branch's signature check with unconditional `true`
+makes all three negative tests fail on unexpected `USERAUTH_SUCCESS`; the positive
+control still passes. Separate verifier unit tests cover truncated fields,
+oversized encoded lengths, algorithm mismatches and trailing fields.
