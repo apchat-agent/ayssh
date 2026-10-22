@@ -83,6 +83,7 @@ fn check_ensure_env() {
 /// A managed sshd process with temp directory for config/keys
 struct SshdInstance {
     child: Child,
+    log: std::fs::File,
     port: u16,
     _tmpdir: tempfile::TempDir,
 }
@@ -147,11 +148,14 @@ impl SshdInstance {
         )
         .map_err(|e| format!("write config: {}", e))?;
 
-        // Start sshd
+        // DEBUG3 can fill a pipe before authentication completes. A tempfile
+        // keeps logging independent of when the test captures diagnostics.
+        let log = tempfile::tempfile().map_err(|e| format!("create sshd log: {}", e))?;
+        let stderr = log.try_clone().map_err(|e| format!("clone sshd log: {}", e))?;
         let child = Command::new(&sshd_path)
             .args(["-D", "-e", "-f"])
             .arg(&config_path)
-            .stderr(std::process::Stdio::piped())
+            .stderr(stderr)
             .spawn()
             .map_err(|e| format!("spawn sshd: {}", e))?;
 
@@ -169,6 +173,7 @@ impl SshdInstance {
 
         Ok(SshdInstance {
             child,
+            log,
             port,
             _tmpdir: tmpdir,
         })
@@ -178,16 +183,13 @@ impl SshdInstance {
 impl SshdInstance {
     /// Capture sshd's stderr log output (call after test, before drop)
     fn capture_log(&mut self) -> String {
-        use std::io::Read;
+        use std::io::{Read, Seek};
         let _ = self.child.kill();
         let _ = self.child.wait();
-        if let Some(ref mut stderr) = self.child.stderr {
-            let mut log = String::new();
-            let _ = stderr.read_to_string(&mut log);
-            log
-        } else {
-            String::new()
-        }
+        let _ = self.log.rewind();
+        let mut log = String::new();
+        let _ = self.log.read_to_string(&mut log);
+        log
     }
 }
 
@@ -725,10 +727,12 @@ fn test_ecdsa_p256_auth_against_real_sshd() {
     )
     .unwrap();
 
+    // Drain-free logging prevents DEBUG3 output from blocking authentication.
+    let mut sshd_log = tempfile::tempfile().unwrap();
     let mut child = std::process::Command::new(&sshd_path)
         .args(["-D", "-e", "-f"])
         .arg(&config_path)
-        .stderr(std::process::Stdio::piped())
+        .stderr(sshd_log.try_clone().unwrap())
         .spawn()
         .unwrap();
 
@@ -768,10 +772,11 @@ fn test_ecdsa_p256_auth_against_real_sshd() {
     // Capture sshd log
     let _ = child.kill();
     let _ = child.wait();
-    if let Some(ref mut stderr) = child.stderr {
-        use std::io::Read;
+    {
+        use std::io::{Read, Seek};
+        sshd_log.rewind().unwrap();
         let mut log = String::new();
-        let _ = stderr.read_to_string(&mut log);
+        sshd_log.read_to_string(&mut log).unwrap();
         for line in log.lines() {
             if line.contains("userauth") || line.contains("pubkey") || line.contains("key")
                 || line.contains("error") || line.contains("fail") || line.contains("Accepted")

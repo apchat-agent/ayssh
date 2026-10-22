@@ -13,3 +13,6 @@ pub use encrypted_io::ServerEncryptedIO;
 pub use host_key::HostKeyPair;
 pub use sftp_server::{SftpHandler, SftpServerSession, MemoryFs};
 pub use test_server::{TestSshServer, AlgorithmFilter, server_handshake};
+
+pub mod production;
+pub use production::{serve_connection, ServerHandler};
