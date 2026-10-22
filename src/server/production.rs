@@ -76,7 +76,10 @@ pub async fn serve_connection<H: ServerHandler + ?Sized>(
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
-            io.send(&channel_message(100, channel.peer)).await?;
+            // RFC 4254 section 5.4: reply only when the request asks for one.
+            if channel.exec_reply {
+                io.send(&channel_message(100, channel.peer)).await?;
+            }
             return Err(error.into());
         }
     };
