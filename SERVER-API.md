@@ -83,3 +83,9 @@ cargo test --test production_server
 
 They require `ssh`, `ssh-keygen`, `sh` and `cat`, isolate client configuration and
 known-host files, and include a three-MiB binary stream and denied request cases.
+
+Authentication regression tests additionally bind proof to the exact username and
+original transport session. Forged signatures, cross-session replay, truncated
+fields, oversized encoded lengths, algorithm mismatches and trailing fields fail
+closed. Review confirmed the same verifier is called by the production signed
+request branch; these tests do not exercise a separate test-only verifier.
