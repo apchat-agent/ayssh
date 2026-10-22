@@ -199,7 +199,11 @@ impl Client {
         // Try to proceed anyway. Wait for the server to finish before asserting
         // the callback count, so a delayed execution cannot escape the assertion.
         self.send(&channel_open()).await;
-        let _ = timeout(DEADLINE, self.transport.send_message(&exec_request(0))).await;
+        // A closed transport is expected if the server already rejected OPEN;
+        // a stalled write is a test failure, not evidence of denial.
+        let _ = timeout(DEADLINE, self.transport.send_message(&exec_request(0)))
+            .await
+            .expect("post-rejection exec write timed out");
         let result = timeout(DEADLINE, &mut self.server)
             .await
             .expect("server accepted post-rejection session traffic")
@@ -280,7 +284,10 @@ async fn registered_key_with_matching_signature_authenticates_and_executes() {
     assert_eq!(client.receive().await, exit);
     assert_eq!(client.receive().await, [96, 0, 0, 0, 0]); // CHANNEL_EOF
     assert_eq!(client.receive().await, [97, 0, 0, 0, 0]); // CHANNEL_CLOSE
-    client.transport.send_channel_close(channel).await.unwrap();
+    timeout(DEADLINE, client.transport.send_channel_close(channel))
+        .await
+        .expect("channel close write timed out")
+        .unwrap();
     timeout(DEADLINE, &mut client.server)
         .await
         .expect("server did not finish")
