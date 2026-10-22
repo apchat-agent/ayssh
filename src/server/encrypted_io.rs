@@ -9,12 +9,12 @@ use crate::transport::{EncryptionState, DecryptionState, encrypt_packet_cbc,
     is_aead_cipher, is_etm_mac, mac_length, gcm_nonce, decrypt_data,
     compute_mac};
 use crate::crypto::cipher::aes_cbc_decrypt_raw;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 /// Server-side encrypted I/O handler
-pub struct ServerEncryptedIO {
-    pub stream: TcpStream,
+pub struct ServerEncryptedIO<S = TcpStream> {
+    pub stream: S,
     /// Encrypt state: server uses s2c keys for sending
     pub(crate) encrypt_state: Option<EncryptionState>,
     /// Decrypt state: server uses c2s keys for receiving
@@ -23,7 +23,7 @@ pub struct ServerEncryptedIO {
     read_buffer: Vec<u8>,
 }
 
-impl std::fmt::Debug for ServerEncryptedIO {
+impl<S> std::fmt::Debug for ServerEncryptedIO<S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ServerEncryptedIO")
             .field("encryption_active", &self.encrypt_state.is_some())
@@ -42,6 +42,23 @@ impl ServerEncryptedIO {
         }
     }
 
+    /// Split independent cipher states so a reader can finish each packet without
+    /// being cancelled when application output becomes ready.
+    pub(crate) fn into_split(self) -> (
+        ServerEncryptedIO<tokio::net::tcp::OwnedReadHalf>,
+        ServerEncryptedIO<tokio::net::tcp::OwnedWriteHalf>,
+    ) {
+        let (read, write) = self.stream.into_split();
+        (
+            ServerEncryptedIO { stream: read, encrypt_state: None,
+                decrypt_state: self.decrypt_state, read_buffer: self.read_buffer },
+            ServerEncryptedIO { stream: write, encrypt_state: self.encrypt_state,
+                decrypt_state: None, read_buffer: Vec::new() },
+        )
+    }
+}
+
+impl<S: AsyncRead + Unpin> ServerEncryptedIO<S> {
     /// Read exactly `n` bytes from the buffer + stream
     pub async fn read_exact_buffered(&mut self, n: usize) -> Result<Vec<u8>, SshError> {
         let mut data = Vec::with_capacity(n);
@@ -89,19 +106,6 @@ impl ServerEncryptedIO {
                 Err(_) => return Err(SshError::TimeoutError),
             }
         }
-    }
-
-    /// Send an encrypted message (or unencrypted if encryption not yet set up)
-    pub async fn send_message(&mut self, payload: &[u8]) -> Result<(), SshError> {
-        if let Some(ref mut enc_state) = self.encrypt_state {
-            let encrypted = encrypt_packet_cbc(payload, enc_state)?;
-            self.stream.write_all(&encrypted).await?;
-        } else {
-            // Send as unencrypted SSH packet
-            let packet = build_unencrypted_packet(payload);
-            self.stream.write_all(&packet).await?;
-        }
-        Ok(())
     }
 
     /// Receive an encrypted message (or unencrypted if decryption not yet set up)
@@ -252,7 +256,8 @@ impl ServerEncryptedIO {
             }
 
             let total_encrypted = 4 + packet_length;
-            let remaining_encrypted = total_encrypted - 16;
+            let remaining_encrypted = total_encrypted.checked_sub(16)
+                .ok_or_else(|| SshError::ProtocolError("Encrypted packet shorter than block".into()))?;
             let rest = self.read_exact_buffered(remaining_encrypted + mac_len).await?;
 
             let mut full_ct = Vec::with_capacity(total_encrypted);
@@ -281,12 +286,28 @@ impl ServerEncryptedIO {
             return Err(SshError::ProtocolError("Decrypted packet too short".to_string()));
         }
         let padding_len = decrypted[4] as usize;
-        let payload_end = decrypted.len() - padding_len;
-        if payload_end <= 5 {
+        let payload_end = decrypted.len().checked_sub(padding_len).unwrap_or(0);
+        if padding_len < 4 || payload_end <= 5 {
             return Err(SshError::ProtocolError("Invalid padding in decrypted packet".to_string()));
         }
         Ok(decrypted[5..payload_end].to_vec())
     }
+}
+
+impl<S: AsyncWrite + Unpin> ServerEncryptedIO<S> {
+    /// Send an encrypted message (or unencrypted if encryption not yet set up)
+    pub async fn send_message(&mut self, payload: &[u8]) -> Result<(), SshError> {
+        if let Some(ref mut enc_state) = self.encrypt_state {
+            let encrypted = encrypt_packet_cbc(payload, enc_state)?;
+            self.stream.write_all(&encrypted).await?;
+        } else {
+            // Send as unencrypted SSH packet
+            let packet = build_unencrypted_packet(payload);
+            self.stream.write_all(&packet).await?;
+        }
+        Ok(())
+    }
+
 }
 
 /// Build an unencrypted SSH binary packet from payload

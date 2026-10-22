@@ -185,15 +185,13 @@ pub async fn server_handshake(
     server_handshake_with_auth(stream, host_key, filter, &AuthBehavior::AcceptAll).await
 }
 
-/// Perform SSH handshake with configurable auth behavior.
-/// With AcceptAll, returns (ServerEncryptedIO, client_channel_id) ready for data exchange.
-/// With RejectPassword, sends USERAUTH_FAILURE and returns (io, 0).
-pub async fn server_handshake_with_auth(
+/// Shared RFC 4253 transport handshake. Authentication is deliberately separate.
+pub(crate) async fn server_transport_handshake(
     stream: TcpStream,
     host_key: &HostKeyPair,
     filter: &AlgorithmFilter,
-    auth_behavior: &AuthBehavior,
-) -> Result<(ServerEncryptedIO, u32), SshError> {
+    signature_algorithms: Option<&[u8]>,
+) -> Result<(ServerEncryptedIO, Vec<u8>), SshError> {
     let mut io = ServerEncryptedIO::new(stream);
     let mut send_seq: u32 = 0;
     let mut recv_seq: u32 = 0;
@@ -294,7 +292,8 @@ pub async fn server_handshake_with_auth(
         return Err(SshError::ProtocolError("KEXDH_INIT too short".to_string()));
     }
     let e_len = u32::from_be_bytes([client_e_data[0], client_e_data[1], client_e_data[2], client_e_data[3]]) as usize;
-    let client_e = &client_e_data[4..4 + e_len];
+    let client_e = client_e_data.get(4..4usize.saturating_add(e_len))
+        .ok_or_else(|| SshError::ProtocolError("Truncated KEXDH_INIT key".into()))?;
     debug!("Client ephemeral key: {} bytes", client_e.len());
 
     // Generate server's ephemeral key and compute shared secret
@@ -416,7 +415,7 @@ pub async fn server_handshake_with_auth(
 
     // RFC 8308 sections 2.3 and 3.1: the client marker permits a server extension message.
     if client_proposal.kex_algorithms.iter().any(|a| a == "ext-info-c") {
-        let algorithms = b"ssh-ed25519,rsa-sha2-512,rsa-sha2-256,ssh-rsa,ecdsa-sha2-nistp256,ecdsa-sha2-nistp384,ecdsa-sha2-nistp521";
+        let algorithms = signature_algorithms.unwrap_or(b"ssh-ed25519,rsa-sha2-512,rsa-sha2-256,ssh-rsa,ecdsa-sha2-nistp256,ecdsa-sha2-nistp384,ecdsa-sha2-nistp521");
         let mut extensions = BytesMut::new();
         extensions.put_u8(7); // SSH_MSG_EXT_INFO
         extensions.put_u32(1);
@@ -426,6 +425,20 @@ pub async fn server_handshake_with_auth(
         extensions.put_slice(algorithms);
         io.send_message(&extensions).await?;
     }
+
+    Ok((io, session_id))
+}
+
+/// Perform SSH handshake with configurable auth behavior.
+/// With AcceptAll, returns (ServerEncryptedIO, client_channel_id) ready for data exchange.
+/// With RejectPassword, sends USERAUTH_FAILURE and returns (io, 0).
+pub async fn server_handshake_with_auth(
+    stream: TcpStream,
+    host_key: &HostKeyPair,
+    filter: &AlgorithmFilter,
+    auth_behavior: &AuthBehavior,
+) -> Result<(ServerEncryptedIO, u32), SshError> {
+    let (mut io, _) = server_transport_handshake(stream, host_key, filter, None).await?;
 
     // Step 7: Handle SERVICE_REQUEST
     let service_req = io.recv_message().await?;

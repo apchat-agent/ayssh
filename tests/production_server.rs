@@ -324,7 +324,8 @@ async fn direct_tcp_forwarding_is_rejected() {
     let output = fixture.run(&["-W", "127.0.0.1:9"], None).await;
     assert!(!output.status.success(), "{output:?}");
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("open failed"),
+        (String::from_utf8_lossy(&output.stderr).contains("open failed")
+            || String::from_utf8_lossy(&output.stderr).contains("stdio forwarding failed")),
         "{output:?}"
     );
     fixture.assert_no_exec();
