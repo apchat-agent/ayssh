@@ -20,6 +20,19 @@ const TIMEOUT: Duration = Duration::from_secs(30);
 const WINDOW: u32 = 1024 * 1024;
 const PACKET: usize = 32 * 1024;
 
+/// Fixed categories for rejected RFC 4252 authentication attempts.
+/// These carry no password, signature, arbitrary error string or method payload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuthRejectionReason {
+    InvalidUsername,
+    UnsupportedService,
+    UnsupportedMethod,
+    UnsupportedKeyAlgorithm,
+    MalformedPublicKey,
+    InvalidSignature,
+    KeyNotAuthorized,
+}
+
 /// Application policy for authenticated command execution.
 ///
 /// The server verifies the RFC 4252 section 7 signature itself. The key callback
@@ -31,6 +44,26 @@ pub trait ServerHandler: Send + Sync {
     /// Authorize this key for this account. Unsupported key algorithms are
     /// rejected before this callback; currently only `ssh-ed25519` is supported.
     async fn authorize_public_key(&self, username: &str, public_key: &[u8]) -> bool;
+
+    /// Observe one rejected authentication attempt, before its failure response.
+    /// The username is claimed, not authenticated. Public-key bytes are supplied
+    /// only for a well-formed supported key; observers may hash them for a public
+    /// fingerprint. Passwords, signatures and arbitrary method payloads are never
+    /// supplied. RFC 4252 section 5.2 `none` discovery is not a credential attempt.
+    /// Malformed wire framing and transport failures remain serve_connection errors.
+    /// Observers must return promptly; the existing authentication deadline applies.
+    async fn auth_refused(
+        &self,
+        _username: Option<&str>,
+        _public_key: Option<&[u8]>,
+        _reason: AuthRejectionReason,
+    ) {
+    }
+
+    /// Observe verified identity after signature and policy checks, before
+    /// USERAUTH_SUCCESS and before any channel or exec request. An unsigned key
+    /// query never invokes this callback. The callback does not grant authority.
+    async fn authentication_succeeded(&self, _username: &str, _public_key: &[u8]) {}
 
     /// Select an executable for a verified account and untrusted command bytes.
     /// Return `None` to refuse the request. No shell interpretation is performed
@@ -178,13 +211,41 @@ async fn authenticate<H: ServerHandler + ?Sized>(
         }
         let username = fields.string()?;
         if username.len() > 256 {
+            handler
+                .auth_refused(None, None, AuthRejectionReason::InvalidUsername)
+                .await;
             return Err(protocol("Account name too long"));
         }
-        let username =
-            std::str::from_utf8(username).map_err(|_| protocol("Account name is not UTF-8"))?;
+        let username = match std::str::from_utf8(username) {
+            Ok(username) => username,
+            Err(_) => {
+                handler
+                    .auth_refused(None, None, AuthRejectionReason::InvalidUsername)
+                    .await;
+                return Err(protocol("Account name is not UTF-8"));
+            }
+        };
         let service = fields.string()?;
         let method = fields.string()?;
-        if service != b"ssh-connection" || method != b"publickey" {
+        if service != b"ssh-connection" {
+            handler
+                .auth_refused(
+                    Some(username),
+                    None,
+                    AuthRejectionReason::UnsupportedService,
+                )
+                .await;
+            io.send_message(&failure).await?;
+            continue;
+        }
+        if method != b"publickey" {
+            // RFC 4252 section 5.2: clients commonly discover available methods
+            // with `none`; it supplies no credential and is not an auth attempt.
+            if method != b"none" {
+                handler
+                    .auth_refused(Some(username), None, AuthRejectionReason::UnsupportedMethod)
+                    .await;
+            }
             io.send_message(&failure).await?;
             continue;
         }
@@ -195,25 +256,50 @@ async fn authenticate<H: ServerHandler + ?Sized>(
         let signature = if signed { Some(fields.string()?) } else { None };
         fields.end()?;
         if algorithm != b"ssh-ed25519" {
+            handler
+                .auth_refused(
+                    Some(username),
+                    None,
+                    AuthRejectionReason::UnsupportedKeyAlgorithm,
+                )
+                .await;
             io.send_message(&failure).await?;
             continue;
         }
-        if let Some(signature) = signature {
-            if verify_signature(session_id, &request[..signed_prefix], blob, signature)
-                && handler.authorize_public_key(username, blob).await
-            {
+        if decode_public_key(blob).is_err() {
+            handler
+                .auth_refused(
+                    Some(username),
+                    None,
+                    AuthRejectionReason::MalformedPublicKey,
+                )
+                .await;
+            io.send_message(&failure).await?;
+            continue;
+        }
+        let reason = if let Some(signature) = signature {
+            // Preserve the security boundary: verify before consulting policy.
+            if !verify_signature(session_id, &request[..signed_prefix], blob, signature) {
+                AuthRejectionReason::InvalidSignature
+            } else if !handler.authorize_public_key(username, blob).await {
+                AuthRejectionReason::KeyNotAuthorized
+            } else {
+                handler.authentication_succeeded(username, blob).await;
                 io.send_message(&[52]).await?;
                 return Ok(username.to_owned());
             }
-        } else if decode_public_key(blob).is_ok()
-            && handler.authorize_public_key(username, blob).await
-        {
+        } else if handler.authorize_public_key(username, blob).await {
             let mut challenge = vec![60];
             string(&mut challenge, algorithm);
             string(&mut challenge, blob);
             io.send_message(&challenge).await?;
             continue;
-        }
+        } else {
+            AuthRejectionReason::KeyNotAuthorized
+        };
+        handler
+            .auth_refused(Some(username), Some(blob), reason)
+            .await;
         io.send_message(&failure).await?;
     }
     Err(SshError::AuthenticationFailed(

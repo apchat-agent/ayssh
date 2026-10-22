@@ -42,6 +42,18 @@ complete authentication request, as specified in RFC 4252 section 7. The callbac
 must authorize both the username and complete public key, not just the username
 or algorithm. The server does not log credentials, keys or commands.
 
+Two optional callbacks let an application audit authentication; both default to
+doing nothing. `auth_refused(username, public_key, reason)` runs before each
+`USERAUTH_FAILURE` with an `AuthRejectionReason` (invalid username, unsupported
+service, method or key algorithm, malformed key, invalid signature, key not
+authorized). The username is claimed, not verified; the key blob is supplied only
+when it decoded as a supported key. RFC 4252 section 5.2 `none` method discovery
+is not reported. `authentication_succeeded(username, public_key)` runs after
+signature verification and policy approval, before `USERAUTH_SUCCESS`; an unsigned
+key query never calls it. Neither callback receives passwords or signatures, and
+neither grants or denies access. Return promptly: both run inside the
+authentication deadline.
+
 Each connection permits one session channel and one exec command. The library
 pipes binary stdin, stdout and stderr without text conversion. Client EOF closes
 child stdin after queued data is consumed. Output streams share the peer's window

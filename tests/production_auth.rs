@@ -5,12 +5,12 @@
 use async_trait::async_trait;
 use ayssh::error::SshError;
 use ayssh::host_key_verify::AcceptAll;
-use ayssh::server::{serve_connection, HostKeyPair, ServerHandler};
+use ayssh::server::{serve_connection, AuthRejectionReason, HostKeyPair, ServerHandler};
 use ayssh::transport::Transport;
 use ed25519_dalek::{Signer, SigningKey};
 use rand::RngCore;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::process::Command;
@@ -70,15 +70,42 @@ fn exec_request(channel: u32) -> Vec<u8> {
     request
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Observation {
+    Refused(Option<String>, Option<Vec<u8>>, AuthRejectionReason),
+    Verified(String, Vec<u8>),
+}
+
 struct Handler {
     key: Vec<u8>,
     executions: Arc<AtomicUsize>,
+    observations: Arc<Mutex<Vec<Observation>>>,
 }
 
 #[async_trait]
 impl ServerHandler for Handler {
     async fn authorize_public_key(&self, username: &str, public_key: &[u8]) -> bool {
         username.as_bytes() == USER && public_key == self.key
+    }
+
+    async fn auth_refused(
+        &self,
+        username: Option<&str>,
+        key: Option<&[u8]>,
+        reason: AuthRejectionReason,
+    ) {
+        self.observations.lock().unwrap().push(Observation::Refused(
+            username.map(str::to_owned),
+            key.map(<[u8]>::to_vec),
+            reason,
+        ));
+    }
+
+    async fn authentication_succeeded(&self, username: &str, key: &[u8]) {
+        self.observations
+            .lock()
+            .unwrap()
+            .push(Observation::Verified(username.to_owned(), key.to_vec()));
     }
 
     async fn exec(&self, username: &str, command: &[u8]) -> Result<Option<Command>, SshError> {
@@ -95,6 +122,7 @@ struct Client {
     transport: Transport,
     key: Vec<u8>,
     executions: Arc<AtomicUsize>,
+    observations: Arc<Mutex<Vec<Observation>>>,
     server: JoinHandle<Result<(), SshError>>,
 }
 
@@ -110,9 +138,11 @@ impl Client {
         let address = listener.local_addr().unwrap();
         let key = public_key(key);
         let executions = Arc::new(AtomicUsize::new(0));
+        let observations = Arc::new(Mutex::new(Vec::new()));
         let handler = Handler {
             key: key.clone(),
             executions: executions.clone(),
+            observations: observations.clone(),
         };
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await?;
@@ -123,6 +153,7 @@ impl Client {
             transport,
             key,
             executions,
+            observations,
             server,
         };
         timeout(DEADLINE, async {
@@ -294,4 +325,196 @@ async fn registered_key_with_matching_signature_authenticates_and_executes() {
         .expect("server panicked")
         .unwrap();
     assert_eq!(client.executions.load(Ordering::SeqCst), 1);
+}
+
+fn auth_failure() -> Vec<u8> {
+    let mut failure = vec![51];
+    string(&mut failure, b"publickey");
+    failure.push(0);
+    failure
+}
+
+#[tokio::test]
+async fn authentication_observer_reports_refusals_before_later_verified_success() {
+    let key = signing_key();
+    let mut client = Client::connect(&key).await;
+    // connect completed an accepted unsigned key query, not authentication.
+    assert!(client.observations.lock().unwrap().is_empty());
+    for method in [b"none".as_slice(), b"password".as_slice()] {
+        let mut request = vec![50];
+        string(&mut request, USER);
+        string(&mut request, b"ssh-connection");
+        string(&mut request, method);
+        if method == b"password" {
+            request.push(0);
+            string(&mut request, b"synthetic-password-not-observed");
+        }
+        client.send(&request).await;
+        assert_eq!(client.receive().await, auth_failure());
+        if method == b"none" {
+            assert!(client.observations.lock().unwrap().is_empty());
+        }
+    }
+    let unknown = public_key(&signing_key());
+    client.send(&auth_prefix(USER, &unknown, false)).await;
+    assert_eq!(client.receive().await, auth_failure());
+    assert_eq!(client.authenticate(&[0; 64]).await, auth_failure());
+    let data = client.data_to_sign(USER, client.transport.session_id().unwrap());
+    assert_eq!(client.authenticate(&key.sign(&data).to_bytes()).await, [52]);
+    assert_eq!(
+        *client.observations.lock().unwrap(),
+        vec![
+            Observation::Refused(
+                Some("account".into()),
+                None,
+                AuthRejectionReason::UnsupportedMethod
+            ),
+            Observation::Refused(
+                Some("account".into()),
+                Some(unknown),
+                AuthRejectionReason::KeyNotAuthorized
+            ),
+            Observation::Refused(
+                Some("account".into()),
+                Some(client.key.clone()),
+                AuthRejectionReason::InvalidSignature
+            ),
+            Observation::Verified("account".into(), client.key.clone()),
+        ]
+    );
+    // Verification is observable even when the client never opens a channel.
+    assert_eq!(client.executions.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn authentication_observer_reports_unsupported_and_malformed_public_keys() {
+    let key = signing_key();
+    let mut client = Client::connect(&key).await;
+    for (algorithm, blob) in [
+        (b"unsupported-key".as_slice(), b"unused".as_slice()),
+        (ALGORITHM, b"truncated".as_slice()),
+    ] {
+        let mut request = vec![50];
+        string(&mut request, USER);
+        string(&mut request, b"ssh-connection");
+        string(&mut request, b"publickey");
+        request.push(0);
+        string(&mut request, algorithm);
+        string(&mut request, blob);
+        client.send(&request).await;
+        assert_eq!(client.receive().await, auth_failure());
+    }
+    assert_eq!(
+        *client.observations.lock().unwrap(),
+        vec![
+            Observation::Refused(
+                Some("account".into()),
+                None,
+                AuthRejectionReason::UnsupportedKeyAlgorithm
+            ),
+            Observation::Refused(
+                Some("account".into()),
+                None,
+                AuthRejectionReason::MalformedPublicKey
+            ),
+        ]
+    );
+    assert_eq!(client.executions.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn authentication_observer_reports_signed_policy_denial_then_verified_success() {
+    let registered = signing_key();
+    let denied = signing_key();
+    let mut client = Client::connect(&registered).await;
+    let denied_blob = public_key(&denied);
+    let mut request = auth_prefix(USER, &denied_blob, true);
+    let data = signed_data(client.transport.session_id().unwrap(), &request);
+    let mut signature = Vec::new();
+    string(&mut signature, ALGORITHM);
+    string(&mut signature, &denied.sign(&data).to_bytes());
+    string(&mut request, &signature);
+    client.send(&request).await;
+    assert_eq!(client.receive().await, auth_failure());
+    assert_eq!(
+        *client.observations.lock().unwrap(),
+        vec![Observation::Refused(
+            Some("account".into()),
+            Some(denied_blob),
+            AuthRejectionReason::KeyNotAuthorized
+        ),]
+    );
+    assert_eq!(client.executions.load(Ordering::SeqCst), 0);
+    let data = client.data_to_sign(USER, client.transport.session_id().unwrap());
+    assert_eq!(
+        client
+            .authenticate(&registered.sign(&data).to_bytes())
+            .await,
+        [52]
+    );
+    assert_eq!(
+        client.observations.lock().unwrap().last(),
+        Some(&Observation::Verified("account".into(), client.key.clone()))
+    );
+    assert_eq!(client.observations.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn authentication_observer_reports_unsupported_service_without_payload() {
+    let registered = signing_key();
+    let mut client = Client::connect(&registered).await;
+    let mut request = vec![50];
+    string(&mut request, USER);
+    string(&mut request, b"unsupported-service");
+    string(&mut request, b"publickey");
+    request.push(0);
+    string(&mut request, ALGORITHM);
+    string(&mut request, &client.key);
+    client.send(&request).await;
+    assert_eq!(client.receive().await, auth_failure());
+    assert_eq!(
+        *client.observations.lock().unwrap(),
+        vec![Observation::Refused(
+            Some("account".into()),
+            None,
+            AuthRejectionReason::UnsupportedService
+        ),]
+    );
+    assert_eq!(client.executions.load(Ordering::SeqCst), 0);
+    let data = client.data_to_sign(USER, client.transport.session_id().unwrap());
+    assert_eq!(
+        client
+            .authenticate(&registered.sign(&data).to_bytes())
+            .await,
+        [52]
+    );
+    assert_eq!(client.observations.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn authentication_observer_reports_invalid_username_length_and_utf8() {
+    for invalid in [vec![b'x'; 257], vec![0xff]] {
+        let registered = signing_key();
+        let mut client = Client::connect(&registered).await;
+        client
+            .send(&auth_prefix(&invalid, &client.key.clone(), false))
+            .await;
+        let result = timeout(DEADLINE, &mut client.server)
+            .await
+            .expect("invalid username must terminate promptly")
+            .expect("production server panicked");
+        assert!(
+            matches!(result, Err(SshError::ProtocolError(_))),
+            "{result:?}"
+        );
+        assert_eq!(
+            *client.observations.lock().unwrap(),
+            vec![Observation::Refused(
+                None,
+                None,
+                AuthRejectionReason::InvalidUsername
+            ),]
+        );
+        assert_eq!(client.executions.load(Ordering::SeqCst), 0);
+    }
 }
